@@ -1,0 +1,118 @@
+---
+title: "Proximidad - Bluetooth"
+author: "Miguel Pérez Barrero"
+date: "2/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Proximidad medida por Bluetooth
+
+```{r Librerías}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+```
+
+
+```{r Carga de datos}
+base_dir <- '../../datasets/SocialEvolution/'
+
+calls <- read.csv2(paste0(base_dir, 'Calls.csv'), sep = ',')
+sms <- read.csv2(paste0(base_dir, 'SMS.csv'), sep = ',')
+proximity <- read.csv2(paste0(base_dir, 'Proximity.csv'), sep = ',')
+```
+
+```{r}
+str(proximity)
+```
+
+
+Inicialmente eliminamos los pares de proximidad que no tienen alguno de los dos extremos o los que los dos extremos son iguales
+
+```{r}
+proximity <- proximity %>% 
+  filter(!is.na(user.id)) %>% 
+  filter(!is.na(remote.user.id.if.known)) %>%
+  filter(user.id != remote.user.id.if.known)
+```
+
+Agrupamos por tiempo
+
+```{r}
+# ultimo domingo de 2007 como fecha base para que las semanas sean regulares entre años
+base = parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+proximity_time <- proximity %>% mutate(
+               time = parse_date_time(time, "y-m-d H:M:S")
+             ) %>%
+             mutate(
+                weekday = wday(time), 
+                week = as.integer(round(difftime(time, base, units = "weeks"))),
+                year_week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time)
+             ) %>% filter(year >= 2008)
+```
+
+```{r}
+proximity_by_week <- proximity_time %>% group_by(user.id, remote.user.id.if.known, week) %>%
+                      summarize(
+                        count = n()
+                      )
+write.csv2(proximity_by_week, "proximity_by_week.csv", row.names = FALSE)
+```
+
+Para facilitar los cálculos, convertimos la matriz de proximidad por semana a matriz cuadrada de Usuarios por usuarios, pero indexada por semana
+
+```{r}
+proximity_adj_matrix <- proximity_by_week %>%
+                    pivot_wider(names_from = remote.user.id.if.known, values_from = count, values_fill = 0)
+write.csv2(proximity_adj_matrix, "proximity_adj_matrix_by_week.csv", row.names = FALSE)
+```
+
+Esta es una matriz de adyacencia entre los sujetos del experimento, los arcos son el número de reportes de coincidencia del bluetooth por semana. En realidad son varias matrices de adyacencia, una por semana.
+Vamos a presentar el grafo de contactos:
+
+```{r}
+library(network)
+
+sel_week <- 40
+
+edges <- proximity_by_week %>% 
+          ungroup %>%
+          filter(week == sel_week) %>%
+          dplyr::select(user.id, remote.user.id.if.known, count) %>%
+          rowwise() %>%
+          transmute(
+            from = user.id,
+            to = remote.user.id.if.known,
+            weight = count 
+          ) %>% 
+          group_by(from, to) %>%
+          summarise(weight = mean(weight)) %>% 
+          ungroup %>%
+          filter(weight >= mean(weight)) ## pintamos solo las relaciones mas relevantes
+
+nodes <- unique(wlan_adjacency_by_week %>% dplyr::select(user_id.x))
+
+routes_network <- network(edges, vertex.attr = nodes, matrix.type = "edgelist", ignore.eval = FALSE)
+plot(routes_network, vertex.cex = 1, mode = "circle", main = paste0("Semana ", sel_week))
+```
+
+Estas matrices de contacto son muy densas.
+
+
+

@@ -1,0 +1,234 @@
+---
+title: "Gripe"
+author: "Miguel Pérez Barrero"
+date: "25/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Estudio de los datos de la gripe
+
+El objetivo es estudiar la tabla de la gripe para ver como representar sus valores como salida.
+
+### Librerías y dependencias
+
+```{r Librerías, message=FALSE, error=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+library(vegan)
+library(MASS)
+library(MASS)
+library(vegan)
+library(FactoMineR)
+```
+
+### Carga de datos
+
+```{r Carga de datos}
+base_dir <- '../../datasets/SocialEvolution/'
+
+flu <- read.csv2(paste0(base_dir, 'FluSymptoms.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+```{r}
+str(flu)
+```
+
+
+### Columnas temporales
+
+```{r}
+flu_time <- flu %>% mutate(
+               time = parse_date_time(time, "y-m-d H:M:S")
+             ) %>%
+             mutate(
+                weekday = wday(time), 
+                week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time) 
+             )
+```
+
+### Por semanas
+
+Se reorganizan los datos en una rejilla de (mes - semana). La semana es la semana del año
+
+```{r}
+by_weeks <- flu_time %>% filter(year == 2009) %>% group_by(week, month, user_id) %>% 
+  summarize(
+    sore.throat.cough = sum(sore.throat.cough),
+    runnynose.congestion.sneezing = sum(runnynose.congestion.sneezing),
+    fever = sum(fever),              
+    nausea.vomiting.diarrhea = sum(nausea.vomiting.diarrhea),     
+    sad.depressed = sum(sad.depressed),             
+    open.stressed = sum(open.stressed)
+  ) %>% mutate(key = week)
+
+
+by_days <- flu_time %>% filter(year == 2009) %>% group_by(year_day, week, month, user_id) %>% 
+  summarize(
+    sore.throat.cough = sum(sore.throat.cough),
+    runnynose.congestion.sneezing = sum(runnynose.congestion.sneezing),
+    fever = sum(fever),              
+    nausea.vomiting.diarrhea = sum(nausea.vomiting.diarrhea),     
+    sad.depressed = sum(sad.depressed),             
+    open.stressed = sum(open.stressed)
+  ) %>% mutate(key = year_day)
+
+by_month <- flu_time %>% filter(year == 2009) %>% group_by(month, user_id) %>% 
+  summarize(
+    sore.throat.cough = sum(sore.throat.cough),
+    runnynose.congestion.sneezing = sum(runnynose.congestion.sneezing),
+    fever = sum(fever),              
+    nausea.vomiting.diarrhea = sum(nausea.vomiting.diarrhea),     
+    sad.depressed = sum(sad.depressed),             
+    open.stressed = sum(open.stressed)
+  ) %>% mutate(key = month)
+```
+
+Intento graficar la evolucion del usuario:
+
+Primero haremos un análisis NDS de kruskal para ver que usuarios tienen una evolución parecida. Esto nos ayudará a colorear los diferentes grupos al presentar la gráfica temporal.
+
+Vemos la propagación de la enfermedad entre los los usuarios. Para ello se puede hacer un análisis MCA [Manual Analisis II, 61] que nos daría un biplot de sintomas y usuarios. Con ello se puede hacer alguna conjetura sobre que usuarios tienen los mismos síntomas.
+El problema es que el MCA nos sirve en un instante de tiempo dato. Habría que "animarlo" para cada instante.
+Es mejor intentar la estrategia de los vectores y el NDS(escalamiento no métrico) de kruskal.
+
+Giramos la matriz para que quede cada usuario en una columna
+```{r}
+fever_matrix <- by_weeks %>% ungroup() %>% 
+  mutate(user_id = paste0("U",user_id))%>%
+  dplyr::select(key, user_id, fever) %>% 
+  group_by(key, user_id) %>% 
+  summarise(fever = sum(fever), .groups = 'drop')
+fever_matrix <- fever_matrix %>% filter(fever != 0)
+fever_matrix <- fever_matrix %>% pivot_wider(names_from = user_id, values_from = fever, values_fill = 0)
+fever_matrix <- fever_matrix %>% ungroup() %>% dplyr::select(-key)
+```
+
+```{r}
+library(corrplot)
+corrplot(cor(fever_matrix), method = 'number', type = "upper", order = "hclust")
+```
+
+```{r}
+fever_matrix <- fever_matrix %>% dplyr::select(-U55, -U72, -U70, -U22, -U44, -U68)
+```
+
+
+```{r}
+fever.dist <- vegdist(t(fever_matrix), method = "clark") # la distancia clark ha sido la que mejor resultado de stress ha dado
+fever.nmds <- isoMDS(fever.dist)
+plot(fever.nmds$points, xlab = "Dimensión 1", ylab = "Dimensión 2", main = paste("Mapa fiebre, stress = ", round(fever.nmds$stress, digits = 2), "%"))
+text(fever.nmds$points, labels = rownames(fever.nmds$points), cex = 0.8)
+```
+
+```{r}
+congestion_matrix <- by_weeks %>% ungroup() %>% 
+                      mutate(user_id = paste0("U", user_id), symptom = runnynose.congestion.sneezing) %>%
+                      dplyr::select(key, user_id, symptom) %>% 
+                      group_by(key, user_id) %>% 
+                      summarise(symptom = sum(symptom), .groups = 'drop')
+congestion_matrix <- congestion_matrix %>% filter(symptom != 0)
+congestion_matrix <- congestion_matrix %>% pivot_wider(names_from = user_id, values_from = symptom, values_fill = 0)
+congestion_matrix <- congestion_matrix %>% ungroup() %>% dplyr::select(-key)
+```
+
+```{r fig.width = 15, fig.asp = 1}
+library(corrplot)
+corrplot(cor(congestion_matrix), method = 'number', type = "upper", order = "hclust")
+```
+
+Los objetos 45 y 46 son iguales. Dejamos 45.
+54 y 55, dejamos 54
+
+```{r}
+congestion_matrix <- congestion_matrix %>% dplyr::select(-U65, -U36)
+```
+
+
+
+```{r}
+set.seed(1)
+
+congestion.dist <- vegdist(t(congestion_matrix), method = "clark") # la distancia clark ha sido la que mejor resultado de stress ha dado
+congestion.nmds <- isoMDS(congestion.dist)
+plot(congestion.nmds$points, xlab = "Dimensión 1", ylab = "Dimensión 2", main = paste("Mapa congestión, stress = ", round(congestion.nmds$stress, digits = 2), "%"))
+text(congestion.nmds$points, labels = rownames(congestion.nmds$points), cex = 0.8)
+```
+
+
+
+```{r}
+sore_matrix <- by_weeks %>% ungroup() %>% 
+                      mutate(user_id = paste0("U", user_id)) %>%
+                      dplyr::select(week, user_id, sore.throat.cough) %>% 
+                      group_by(week, user_id) %>% 
+                      summarise(sore.throat.cough = sum(sore.throat.cough), .groups = 'drop')
+sore_matrix <- sore_matrix %>% filter(sore.throat.cough != 0)
+sore_matrix <- sore_matrix %>% pivot_wider(names_from = user_id, values_from = sore.throat.cough, values_fill = 0)
+sore_matrix <- sore_matrix %>% ungroup() %>% dplyr::select(-week)
+```
+
+```{r fig.width = 15, fig.asp = 1}
+corrplot(cor(sore_matrix), method = 'number', type = "upper", order = "hclust")
+```
+
+```{r}
+sore_matrix <- sore_matrix %>% dplyr::select(-U70, U52)
+```
+
+
+```{r}
+set.seed(1)
+sore.dist <- vegdist(t(sore_matrix), method = "clark") # la distancia clark ha sido la que mejor resultado de stress ha dado
+sore.nmds <- isoMDS(sore.dist)
+plot(sore.nmds$points, xlab = "Dimensión 1", ylab = "Dimensión 2", main = paste("Mapa tos, stress = ", round(sore.nmds$stress, digits = 2), "%"))
+text(sore.nmds$points, labels = rownames(sore.nmds$points), cex = 0.8)
+```
+le hacemos un k medias para clusterizar
+
+```{r}
+f.clust <- function(num_clusters, nmds, main) {
+  clust <- kmeans(nmds$points, num_clusters)$cluster
+  palette(rainbow(num_clusters))
+  plot(nmds$points, type = "n", ylab = "Y", xlab =
+  "X", main = main)
+  text(nmds$points, labels = rownames(nmds$points), cex = 0.6, col =
+  clust)
+  abline(h = 0, lty = 3)
+  abline(v = 0, lty = 3)
+}
+```
+
+Clusterizamos los mapas obtenidos para ver sujetos con sintomatología similar.
+
+```{r Mapas de usuarios con sintomas similares, fig.width = 10, fig.asp=1}
+set.seed(9)
+f.clust(8, sore.nmds, 'Sore')
+f.clust(8, congestion.nmds, 'Congestion')
+f.clust(5, fever.nmds, 'Fever')
+```
+
+Usando la librería de gráfos podemos ver si hay usuarios muy relacionados entre si por sintomas.
+La idea es asignar a cada usuario el cluster después de hacer el NDS y cuando dos usuarios están en el mismo cluster, unirlos por arcos en el grafo. Si esto vuelve a pasar con otro sintoma, el arco adquiere un +1 en el peso. 
+Al final, los usuarios que coinciden en clusters en varios sintomas tendrán conexiones muy pesadas en el grafo.
+
+Ver este artículo: https://www.jessesadler.com/post/network-analysis-with-r/
+
+
+
+
