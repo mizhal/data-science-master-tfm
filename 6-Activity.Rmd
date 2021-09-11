@@ -1,0 +1,274 @@
+---
+title: "Grafo de interacción por participación en la misma actividad"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+```{r setup-6, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Vamos a calcular otra matriz de relaciones a través de las actividades. 
+Esta es un poco diferente, debido a que los datos los tenemos por mes, así que tendremos que desagregar replicando las columnas de forma que podamos usarlos por semana.
+
+Además será necesario imputar los meses que falten. Por la naturaleza de los datos, que se refieren a actividades o cursos matriculados, la ausencia de un mes no implica que el usuario se haya desmatriculado. Por eso se asumirá que en los meses que no hay datos, continúan vigentes los datos anteriores.
+
+Además, igual que con los datos de wifi, hay que hacer un cruce de la tabla con sigo misma para ver que pares de sujetos están juntos en una actividad.
+
+```{r Librerías-6, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+library(glue)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+# Grafo de interacción por actividades comunes
+
+Se cargan los datos y se muestra la estructura.
+
+```{r Carga de datos-6}
+base_dir <- '../../datasets/SocialEvolution/'
+
+activities <- read.csv2(paste0(base_dir, 'Activities.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+```{r render=lemon_print}
+str(activities)
+```
+
+## Ajuste de los datos a la rejilla de tiempo
+
+En este caso, como la encuesta solo se recogió en los meses de septiembre de 2008, marzo, abril y junio de 2009, necesitamos imputar los valores intermedios.
+
+```{r}
+unique(activities$survey.month)
+```
+
+A priori, al tratarse de cursos universitarios, podemos afirmar que si se declara una actividad en septiembre se continuaría con ella hasta el siguiente informe de marzo.
+Lo mismo haremos con el mes de mayo que nos falta y asumiremos el valor de abril.
+
+Para ello, completamos los datos duplicando el valor como se ha dicho.
+La copia se realiza creando un data frame que en una columna tiene el mes original y en otra el mes donde será copiado. Al hacer un cruce con los datos originales, las filas se replicarán en aquellos registros que tienen el mes original.
+
+Luego se descarta la columna del mes original y quedaría una tabla con todos los meses rellenos.
+
+```{r render=lemon_print}
+mapping.copy <- data.frame(
+  survey.month = c(
+    "2008.09",
+    "2008.09",
+    "2008.09",
+    "2008.09",
+    "2008.09",
+    "2008.09",
+    "2009.03",
+    "2009.04",
+    "2009.04",
+    "2009.06"
+  ),
+  full.month =     c(
+    "2008.09",
+    "2008.10",
+    "2008.11",
+    "2008.12",
+    "2009.01",
+    "2009.02",
+    "2009.03",
+    "2009.04",
+    "2009.05",
+    "2009.06"
+  )
+)
+head(mapping.copy)
+```
+Realizamos la copia con un left join entre la tabla de copias y la inicial.
+
+```{r render=lemon_print}
+activities_full <- mapping.copy %>%
+                    left_join(
+                      activities,
+                      by = "survey.month"
+                    ) %>% 
+                   transmute(
+                     survey.month = full.month,
+                     user.id = user.id,
+                     activity = campus.organization
+                   ) %>%
+                   arrange(survey.month, user.id)
+```
+Ahora ponemos columnas año y mes para ayudarnos a insertar los datos en la rejilla Semana-Usuario que estamos usando para todas las demás matrices.
+
+```{r render=lemon_print}
+base = parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+activities_time <- activities_full %>% mutate(
+               time = parse_date_time(survey.month, "y.m")
+             ) %>%
+             transmute(
+                year = year(time),
+                month = month(time),
+                user_id = user.id,
+                activity = activity
+             ) %>% 
+             filter(year >= 2008) %>% arrange(year, month, user_id)
+```
+
+A continuación hay que expandir los datos para que aparezcan agrupados por semana.
+
+Inicialmente, lo que haremos es generar una rejilla completa para imputar los usuarios faltantes, añadir una columna año y mes y hacer un join con los datos originales, de tal manera que se repliquen adecuadamente.
+
+```{r render=lemon_print}
+grid.months <- unique(activities_full$survey.month)
+grid.users <- unique(subjects$user_id)
+activities_full_grid <- expand.grid(time = grid.months, user_id = grid.users)
+
+activities_full_grid <- activities_full_grid %>%
+                        mutate(
+                          time = parse_date_time(time, 'y.m')
+                        ) %>%
+                        transmute(
+                          year = year(time),                          
+                          month = month(time),
+                          user_id = user_id
+                        ) %>% arrange(year, month, user_id)
+```
+
+Con el mes el año y el usuario ya podemos hacer left join con la tabla de datos original.
+
+```{r  render=lemon_print}
+activities_full_grid_2 <- activities_full_grid %>%
+                        left_join(
+                          activities_time,
+                          by=c('year', 'month', 'user_id')
+                        )
+```
+Aún nos falta poner los datos por semana para que la rejilla sea la misma que el resto de matrices de adyacencia.
+
+Para ello generamos una rejilla con las semanas, mes y año asociado y luego hacemos un left join que cause que se dupliquen los datos de cada mes por la semana.
+
+```{r render=lemon_print}
+activity_week_grid <- data.frame(week = 35:74) %>% 
+                      transmute(
+                        year = year(base + weeks(week)),
+                        month = month(base + weeks(week)),
+                        week = week
+                      )
+```
+```{r render=lemon_print}
+activities_full_grid_3 <- activity_week_grid %>% 
+                          left_join(
+                            activities_full_grid_2,
+                            by = c("year", "month")
+                          ) %>% 
+                          arrange(year, month, week) %>% 
+                          filter(!is.na(user_id))
+```
+
+## Generación del grafo de actividades compartidas
+
+Lo siguiente es cruzar la tabla con sigo misma por Actividad y semana para ver que usuarios han compartido actividad, al igual que se hizo con las wifis.
+
+```{r render=lemon_print}
+activities_shared <- activities_full_grid_3 %>%
+                     left_join(
+                       activities_full_grid_3,
+                       by = c("week", "activity")
+                     ) %>% 
+                     filter(user_id.x != user_id.y) %>%
+                     transmute(
+                       week = week,
+                       user_id.x = user_id.x,
+                       user_id.y = user_id.y,
+                       activity = activity
+                     ) %>%
+                     arrange(
+                       week, user_id.x, user_id.y
+                     )
+```
+Finalmente, para generar la lista de ejes, agrupamos por semana, sujeto x y sujeto y y contamos las actividades:
+
+```{r render=lemon_print}
+activities_edge_list <- activities_shared %>%
+                        group_by(week, user_id.x, user_id.y) %>%
+                        summarise(
+                          weight = n(),
+                          .groups = 'drop'
+                        ) %>% ungroup()
+head(activities_edge_list)
+```
+En esta tabla no tenemos todos los pares de usuario en las semanas. Necesitamos completar los datos de nuevo con una rejilla:
+
+```{r}
+weeks <- unique(activities_shared$week)
+user_ids <- unique(subjects$user_id)
+activities_edge_grid <-
+  expand.grid(week = weeks,
+              user_id.x = user_ids,
+              user_id.y = user_ids)
+activities_edge_grid$weight = 0
+
+activities_edge_full <- activities_edge_grid %>%
+  full_join(activities_edge_list) %>%
+  group_by(week, user_id.x, user_id.y) %>%
+  summarise(weight = max(weight), .groups = 'drop') %>%
+  ungroup() %>% arrange(week, user_id.x, user_id.y)
+```
+
+Se muestra un gráfico de la coincidencia en una semana
+
+```{r fig.width=15, fig.asp=0.5}
+sel_week <- 65
+prox_week <-
+  activities_edge_full %>% filter(week == sel_week) %>% dplyr::select(-week)
+ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+  geom_tile(aes(fill = weight)) +
+  lims(x = c(1, 84), y = c(1, 84)) +
+  labs(x = "Subject A",
+       y = "Subject B",
+       title = paste("Semana", sel_week))
+```
+
+Ahora construimos la matriz de adyacencia a partir del data.frame de lista de arcos:
+
+```{r}
+activity_adj_matrix <- activities_edge_full %>%
+  pivot_wider(names_from = user_id.y,
+              values_from = weight,
+              values_fill = 0)
+write.csv2(activity_adj_matrix, "activity_adj_matrix.csv", row.names = FALSE)
+```
+
+
+
+
+

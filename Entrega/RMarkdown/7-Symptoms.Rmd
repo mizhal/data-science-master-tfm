@@ -1,0 +1,137 @@
+---
+title: "Construcción de la matriz de síntomas"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-7, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Construcción de la matriz de síntomas
+
+Se busca construir una matriz de síntomas por usuario y semana para luego poder calcular la *exposición* de manera simple como multiplicación de matrices.
+
+Para ello vamos a cargar el dataset "flu". Al igual que con el resto de datasets, añadiremos una serie de columnas de tiempo para facilitar el procesamiento posterior. De nuevo, la columna de semanas se calculará con referencia al 30 de Diciembre de 2007.
+
+Además, se agregan por semana los síntomas.
+
+```{r Librerías-7, results='hide', message=FALSE, warning=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(lubridate)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+```{r}
+base_dir <- '../../datasets/SocialEvolution/'
+
+flu <- read.csv2(paste0(base_dir, 'FluSymptoms.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+
+base <- parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+flu_time <- flu %>% mutate(
+               time = parse_date_time(time, "y-m-d H:M:S")
+             ) %>%
+             mutate(
+                weekday = wday(time), 
+                week = as.integer(round(difftime(time, base, units = "weeks"))),
+                year_week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time)
+             ) %>% filter(year >= 2008) %>% arrange(week, user_id) %>%
+             ungroup()
+
+symptoms_by_weeks <- flu_time %>% filter(year == 2009) %>% 
+  group_by(week, user_id) %>% 
+  summarize(
+    sore.throat.cough = sum(sore.throat.cough),
+    runnynose.congestion.sneezing = sum(runnynose.congestion.sneezing),
+    fever = sum(fever),              
+    nausea.vomiting.diarrhea = sum(nausea.vomiting.diarrhea),     
+    sad.depressed = sum(sad.depressed),             
+    open.stressed = sum(open.stressed)
+  ) %>% ungroup()
+
+write.csv2(symptoms_by_weeks, "symptoms_by_weeks.csv", row.names = FALSE)
+```
+
+```{r render=lemon_print}
+head(symptoms_by_weeks)
+```
+
+
+```{r render=lemon_print}
+summary(symptoms_by_weeks)
+```
+
+Construimos la rejilla completa al igual que hemos hecho con el resto de datasets para completar los datos que falten. En este caso, los datos no declarados se completan con ceros y se asume ausencia del síntoma.
+
+```{r render=lemon_print}
+grid.weeks <- 40:70
+grid.users <- subjects$user_id
+symptoms_full_grid <- expand.grid(week = grid.weeks, user_id = grid.users)
+symptoms_full_grid$sore.throat.cough = 0
+symptoms_full_grid$fever = 0
+symptoms_full_grid$runnynose.congestion.sneezing = 0
+symptoms_full_grid$nausea.vomiting.diarrhea = 0
+symptoms_full_grid$sad.depressed = 0
+symptoms_full_grid$open.stressed = 0
+
+head(symptoms_full_grid)
+```
+Combinamos los datos de la matriz real. En la práctica esto supone imputar con ceros los datos faltantes.
+
+```{r render=lemon_print}
+symptoms_full_grid <- symptoms_full_grid %>%
+  full_join(symptoms_by_weeks) %>%
+  group_by(week, user_id) %>%
+  summarise(
+    sore.throat.cough = max(sore.throat.cough),
+    fever = max(fever),
+    runnynose.congestion.sneezing = max(runnynose.congestion.sneezing),
+    nausea.vomiting.diarrhea = max(nausea.vomiting.diarrhea),
+    sad.depressed = max(sad.depressed),
+    open.stressed = max(open.stressed),
+    .groups = 'keep'
+  ) %>% ungroup()
+head(symptoms_full_grid %>% filter(runnynose.congestion.sneezing > 0))
+```
+Guardamos la matriz de síntomas.
+
+```{r}
+write.csv2(symptoms_full_grid, "symptoms_full_grid.csv", row.names = FALSE)
+```
+
+

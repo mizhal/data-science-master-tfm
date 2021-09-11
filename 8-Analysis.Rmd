@@ -1,0 +1,854 @@
+---
+title: "Analisis de la combinación de grafos"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-8, include=FALSE}
+library(lemon)
+library(knitr)
+knit_print.data.frame <- lemon_print
+knitr::opts_chunk$set(echo = TRUE, render=lemon_print)
+```
+
+Una vez generados todos los grafos que vamos a usar para modelar la expansión de síntomas de la gripe, es necesario construir la tabla de datos que alimentará al modelo. 
+
+Esta tabla de datos se basa en calcular, para cada perido, es decir para cada semana, un valor de exposición al síntoma en las tres semanas anteriores basado en cada uno de los modos de interacción que hemos visto. 
+Por ello, la tabla tendrá tres columnas para cada grafo de interacción y una columna final, la variable dependiente, con el valor del síntoma en la semana actual.
+
+El cálculo de la exposición se detalla más adelante, pero abreviando se puede decir que se basa en contar todas las interacciones con personas afectadas del sintoma en cada una de las semanas.
+
+Al final, lo importante es la relación entre esas columnas, que reflejan la evolución del síntoma en ventanas de 4 semanas, por eso se omitirá el id del usuario y el número de semana para hacer el modelado.
+
+# Construcción de la matriz de datos
+
+```{r Librerías-8, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(lubridate)
+library(caret)
+library(scales)
+library(mgcv)
+library(rpart)
+library(lmtest)
+library(CCA)
+library(psych)
+library(corrplot)
+library(nnet)
+library(doParallel)
+```
+
+## Análisis de la exposición al síntoma mediante interacciones
+
+### Carga de datos
+
+```{r Carga de datos-8}
+wifi_adj <- read.csv2('wlan_adjacency_by_week.csv')
+bluetooth_adj <- read.csv2('proximity_adj_matrix_by_week.csv')
+communication_adj <- read.csv2('communication_adj_matrix.csv')
+activity_adj <- read.csv2('activity_adj_matrix.csv')
+friends_adj  <- read.csv2('friends_adj_matrix.csv')
+
+symptoms <- read.csv2('symptoms_full_grid.csv')
+
+base_dir <- '../../datasets/SocialEvolution/'
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+### Verificación de la estructura de los grafos
+
+Verificamos que las matrices de los grafos son cuadradas y tienen los registros adecuados, deben ser 86 columnas (84 individuos mas la columna del user_id y la de la semana) y 84 registros por cada semana.
+
+```{r Verificaciones de corrección de los grafos}
+count.no.84 <- function(df) {
+  dim(df %>% 
+        group_by(week) %>% 
+        summarise(count = n(), .groups = "drop") %>% 
+        filter(count != 84))[[1]]
+}
+
+diags <- function(df) {
+  weeks <- min(df$week):max(df$week)
+  sumdiags <- 0
+  for (w in weeks) {
+    m <- df %>% filter(week == 40) %>% select(-week,-user_id.x)
+    sumdiags <- sumdiags + sum(diag(as.matrix(m)))
+  }
+  sumdiags
+}
+
+data.frame(
+  dataset = c(
+    "wifi",
+    "bluetooth",
+    "calls+sms",
+    "activities",
+    "friends",
+    "symptoms"
+  ),
+  weeks.without.84.rows = c(
+    count.no.84(wifi_adj),
+    count.no.84(bluetooth_adj),
+    count.no.84(communication_adj),
+    count.no.84(activity_adj),
+    count.no.84(friends_adj),
+    "NO APLICA"
+  ),
+  min_week = c(
+    min(wifi_adj$week),
+    min(bluetooth_adj$week),
+    min(communication_adj$week),
+    min(activity_adj$week),
+    min(friends_adj$week),
+    min(symptoms$week)
+  ),
+  max_week = c(
+    max(wifi_adj$week),
+    max(bluetooth_adj$week),
+    max(communication_adj$week),
+    max(activity_adj$week),
+    max(friends_adj$week),
+    max(symptoms$week)
+  ),
+  diagonals = c(
+    diags(wifi_adj),
+    diags(bluetooth_adj),
+    diags(communication_adj),
+    diags(activity_adj),
+    diags(friends_adj),
+    "NO APLICA"
+  )
+)
+```
+
+Se puede ver en la columna *weeks.without.84.rows* que ninguna de las matrices de adyacencia es incompleta, todas tienen todas sus semanas con 84 filas.
+También se puede ver que *las diagonales son siempre cero en las matrices*. Con esto nos aseguramos que el valor del propio sujeto no cuenta para calcular la exposición, como ahora veremos.
+
+### Descripción de los conceptos necesarios para construir la matriz combinada
+
+En cuanto a la construcción de la matriz combinada, la idea es reflejar la evolución en cada periodo de un síntoma en un *sujeto principal*. Para ello se miran los 3 periodos anteriores y para cada uno de ellos se calcula el nivel de exposición.
+El nivel de exposición tiene en cuenta que otros sujetos tenían el mismo síntoma, con cuantos de ellos y con que intensidad se ha relacionado el *sujeto principal*.
+
+Como las matrices de adyacencia nos dan una "cuantía de la relación" (haber estado en las mismas wifis, hablar por teléfono, compartir actividades...) calcularemos la exposición como el producto de la "cuantía de relación" con el nivel de síntomas que hemos registrado para cada sujeto secundario.
+
+$E[week]_i = \sum_{j\neq{i}} G[week]_{i,j} * S[week]_{j}$
+
+Donde $G_{i,j}$ es el valor de la matriz de adyacencia de uno de los grafos (wifi, bluetooth, etc) en la fila i y columna j.
+
+Teniendo en cuenta que los registros son temporales, consideramos que:
+
+$S_i[t] = f(E_i[t-1], E_i[t-2], E_i[t-3])$
+
+Es decir, que el estado actual de un síntoma está relacionado con las exposiciones al síntoma en tres periodos anteriores. En el mejor caso sería una relación lineal, pero si no lo es podría ser un árbol de decisión o una formula no lineal calculada mediante una red neuronal.
+
+Así pues, construimos una matriz de datos con la estructura siguiente:
+
+Para cada Sujeto $i$, para cada periodo $t$
+
+ * Tres columnas con la Exposición $E_i$ en $t-1$, $t-2$, $t-3$ por cada uno de los grafos de interacciones (Wifi, Bluetooth, Llamadas, Actividades, Amistad).
+ * Una columna con el estado del Síntoma en el periodo $t$ o $S_i[t]$.
+ 
+Al final, la matriz es como una ventana deslizante de 4 semanas a través de el historial de contactos y síntomas de cada sujeto. 
+ 
+### Composición de la matriz combinada
+
+Debemos generar una rejilla que tenga todas las semanas del rango que vamos a estudiar y por cada semana, todos los usuarios.
+Después, para calcular el valor de cada columna de periodos, usaremos mutate usando la columna de la semana y el usuario como parámetros.
+
+```{r Rejilla de la matriz definitiva}
+weeks <-
+  (40 + 4):70 # desplazamos el inicio 4 semanas para que haya datos suficientes para calcular los sintomas de las 3 semanas anteriores
+user_ids <- unique(subjects$user_id)
+
+exposition_matrix <-
+  expand.grid(week = weeks, user_id = user_ids) %>%
+  arrange(week, user_id)
+```
+
+Definimos funciones de R para calcular el valor de exposicion $E_i[t]$ y el valor de sintoma $S_i[t]$.
+
+```{r Funciones para cálculo de la exposición}
+exposition <-
+  function(s_week,
+           s_user_id,
+           adjacency_matrix,
+           symptom_name,
+           symptoms) {
+    row <- adjacency_matrix %>%
+      filter(week == s_week) %>%
+      filter(user_id.x == s_user_id) %>%
+      select(-week,-user_id.x)
+    symptom_col <-
+      symptoms %>% filter(week == s_week) %>% select(symptom_name)
+    ## producto escalar
+    as.matrix(row) %*% as.matrix(symptom_col)
+  }
+
+symptom_value <-
+  function (s_week, s_user_id, symptom_name, symptoms) {
+    as.matrix(
+      symptoms %>% 
+        filter(week == s_week) %>% 
+        filter(user_id == s_user_id) %>%
+        select(symptom_name)
+    )
+  } 
+```
+
+Ahora generamos la matriz usando estas dos funciones y moviendo los parámetros.
+La forma de generar la matriz es similar a lo que se haría con Excel, poniendo todos los periodos multiplicados por todos los usuarios en las primeras dos columnas y luego unas formulas que se replican para cada fila.
+
+Para generar la matriz vamos a escoger el síntoma "Congestión".
+
+```{r Generación de la matriz definitiva, eval = FALSE}
+symptom <- 'runnynose.congestion.sneezing'
+compound_data <- exposition_matrix %>%
+  rowwise() %>%
+  mutate(
+    wifi_1 = exposition(week - 1, user_id, wifi_adj, symptom, symptoms),
+    wifi_2 = exposition(week - 2, user_id, wifi_adj, symptom, symptoms),
+    wifi_3 = exposition(week - 3, user_id, wifi_adj, symptom, symptoms),
+    bluetooth_1 = exposition(week - 1, user_id, bluetooth_adj, 
+                             symptom, symptoms),
+    bluetooth_2 = exposition(week - 2, user_id, bluetooth_adj, 
+                             symptom, symptoms),
+    bluetooth_3 = exposition(week - 3, user_id, bluetooth_adj, 
+                             symptom, symptoms),
+    
+    communication_1 = exposition(week - 1, user_id,
+                                 communication_adj, symptom, symptoms),
+    communication_2 = exposition(week - 2, user_id, 
+                                 communication_adj, symptom, symptoms),
+    communication_3 = exposition(week - 3, user_id, 
+                                 communication_adj, symptom, symptoms),
+    
+    friends_1 = exposition(week - 1, user_id, friends_adj, symptom, symptoms),
+    friends_2 = exposition(week - 2, user_id, friends_adj, symptom, symptoms),
+    friends_3 = exposition(week - 3, user_id, friends_adj, symptom, symptoms),
+    activity_1 = exposition(week - 1, user_id, activity_adj, symptom, symptoms),
+    activity_2 = exposition(week - 2, user_id, activity_adj, symptom, symptoms),
+    activity_3 = exposition(week - 3, user_id, activity_adj, symptom, symptoms),
+    symptom = symptom_value(week, user_id, symptom, symptoms)
+  )
+```
+
+```{r eval=FALSE, echo=FALSE}
+saveRDS(compound_data, "runnynose.congestion.sneezing_compound.RData")
+write.csv2(compound_data, 
+           "compount.runnynose.congestion.sneezing_compound.csv")
+```
+
+### Presentación descriptiva de las características de la matriz combinada
+
+```{r echo=FALSE}
+compound_data = readRDS("runnynose.congestion.sneezing_compound.RData")%>% 
+  ungroup()
+```
+
+
+Vamos a ver la estructura y la distribución del dataset que hemos construido.
+
+```{r}
+str(compound_data)
+```
+
+```{r}
+summary(compound_data)
+```
+
+Ahora mostramos las distribuciones de cada una de las variables
+
+```{r Distribuciones de variables, render=knit_print}
+data <- compound_data %>% select(-week, -user_id)
+## quitamos las duplicadas
+data <- data[!duplicated(data), ]
+
+data2 <-
+  data %>% 
+  pivot_longer(colnames(data), names_to = "variable", values_to = "value")
+
+ggplot(data2, aes(x = variable, y = value)) +
+  geom_boxplot(aes(fill = variable)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "Distribución de variables") + 
+  xlab("variable") + ylab("valor")
+```
+
+Se puede ver que la mayoría de las variables están muy sesgadas hacia la derecha, esto probablemente complicará la linealidad del modelo y debamos acudir a otras soluciones de minería.
+
+## Análisis de la influencia de las interacciones en el síntoma "Congestión"
+
+Probamos un modelo lineal básico, aunque la poca normalidad de las variables no haga tener muchas esperanzas con esto.
+También eliminamos las columnas que no necesitamos y las filas que tienen todo ceros.
+
+```{r Preparación de los datos: limpieza de filas vacías y duplicados}
+data <- compound_data %>% select(-week, -user_id) %>% ungroup()
+## quitamos las columnas que tienen todo a cero
+data <-
+  data %>% 
+    rowwise() %>% 
+    mutate(sum = sum(cur_data())) %>% 
+    filter(sum > 0) %>% 
+    select(-sum) %>%
+    ungroup()
+## quitamos las duplicadas
+data <- data[!duplicated(data),]
+```
+
+Planteamos el modelo lineal.
+
+```{r Modelo lineal, render=knit_print}
+linear.model.001 <- lm(symptom ~ ., data)
+summary(linear.model.001)
+```
+
+Salen ciertas columnas como significativas y la F también es significativa (< 0.05), así que existe relación entre la información que hemos recogido de los sensores y las estadísticas y tener síntomas en un momento dado.
+
+Las ubicaciones calculadas por wifi se muestran relevantes, aunque quizás mejorando el clustering pudieran serlo más.
+
+Buscamos más información mediante tests sobre los residuos del modelo.
+
+```{r Tests de normalidad y homocedasticidad, render=knit_print}
+shapiro.test(linear.model.001$residuals)
+bptest(linear.model.001)
+```
+
+Como salen menores que $alpha$ ambos, nos indican que los residuos no son normales ni homocedásticos, lo que unido al $R^2$ tan bajo nos indica que las relaciones no se modelan bien con un modelo lineal. Era lo esperado teniendo en cuenta las distribuciones de las variables, pero la idea era solo ver que había cierta influencia de las variables predictoras.
+
+Probamos un modelo lineal con los datos en logaritmos, que es algo que reduce el sesgo lateral.
+
+```{r modelo logarítmico, render=knit_print}
+data.log <- log(data + 1)
+
+linear.model.002 <- lm(symptom ~ ., data.log)
+summary(linear.model.002)
+```
+
+Se ve que no mejora el $R^2$ y todavía estamos en un nivel de explicación del fenómeno parecido al azar. Algo interesante que se empieza a ver es que las columnas más significativas cambian, centrandose en la proximidad por bluetooth e ir a las mismas actividades. 
+
+Y parece algo de sentido común, ya que el bluetooth es un sensor que mucha cercanía y estar en una misma activcidad también implica cercanía.
+
+#### Análisis de correlación y componentes principales
+
+Mostramos la correlación entre variables como parte de la exploración de los datos.
+
+```{r Correlación, fig.width=7, fig.asp=1, render=knit_print}
+data.cor <- cor(data)
+corrplot(data.cor, method = "number")
+```
+Existen columnas con alta correlación, que son las que provienen de los datos expresados en meses y no en semanas como estamos considerando. En estos casos, como hubo que duplicar datos, que haya correlación es lo esperable. Por el momento no me planteo eliminarlas pues pueden aportar algo de información.
+
+Usamos los test de esfericidad de Bartlett y KMO para ver si podemos aplicar análisis factorial a los datos.
+
+```{r Test de esfericidad, render=knit_print}
+cortest.bartlett(data.cor, n = 100)
+KMO(data.cor)
+``` 
+
+El nivel obtenido en general en los tests es "mediano" pero se puede aplicar el análisis factorial para recabar más información.
+
+Se hace un análisis de componentes principales para ver como se distribuye la varianza.
+
+```{r Componentes principales, render=knit_print}
+data.pc <- princomp(data.cor, cor = TRUE)
+plot(data.pc)
+abline(h = 1)
+```
+
+Parece que la mayor cantidad de información está en dos componentes.
+
+```{r Número de componentes factoriales, render=knit_print}
+fa.model.002 <-
+  fa.parallel(data.cor, n.obs = length(data.cor), fm = "ml")
+```
+
+```{R Análisis factorial, render=knit_print}
+fa.model.003 <-
+  fa(
+    data.cor,
+    n.obs = length(data.cor),
+    fm = "ml",
+    nfactors = 3,
+    rotate = "varimax",
+    scores = T
+  )
+corrplot(fa.model.003$loadings)
+```
+
+Según esta distribución espectral de la información, hay tres grupos principales de varianza: los sensores (wifi y bluetooth), la encuesta de amistad y la encuesta de actividades comunes.
+Según parece, los datos de llamadas y SMS no van a tener mucha influencia en la transmisión del síntoma.
+
+```{r Comunalidades de las variables, render=knit_print}
+par(mar = c(4, 9, 4, 4))
+barplot(
+  fa.model.003$communalities,
+  main = "Comunalidades de las variables",
+  xlim = c(0, 1.2),
+  horiz = TRUE,
+  las = 1
+)
+abline(v = 1, col = 'red')
+```
+Las variables de amistad, wifis y bluetooth están bastante relacionadas, pero sin embargo la variable de comunicación parece no estarlo en absoluto.
+Parece ser que las matrices de actividad, amistad, wifi y bluetooth realmente llevan mucha información común. Podríamos reducirlas de cara a modelizar mejor, pero por el momento me interesa ver como se comportan separadas.
+
+### Análisis con modelo lineal generalizado
+
+Como en el modelo lineal se podía ver que los residuos no eran de distribución normal y tampoco homocedásticos, parece interesante usar un modelo generalizado, ya que es capaz de trabajar con estas condiciones.
+
+Usamos varias familias y funciones link para determinar si es un problema de regresión u otra cosa.
+
+```{r Modelos lineales generalizados, warning=FALSE, error=FALSE}
+formula <- symptom ~ .
+g1 <-
+  glm(formula, data = data, family = poisson(link = "log"))
+g2 <- glm(formula, data = data, family = gaussian())
+g3 <-
+  glm(log(symptom + 1) ~ ., data = data, family = gaussian())
+
+formula <-
+  symptom + 1 ~ wifi_1 + wifi_2 + wifi_3 +  bluetooth_1 + bluetooth_2 + 
+  bluetooth_3 +  communication_1 + communication_2 + communication_3 + 
+  friends_1 + friends_2 + friends_3 + activity_1 + activity_2 + activity_3
+
+g4 <-
+  mgcv::gam(formula, data = data, family = gaussian(link = "identity"))
+g5 <-
+  mgcv::gam(formula, family = gaussian(link = "inverse"), data = data)
+g6 <-
+  mgcv::gam(formula, family = gaussian(link = "log"), data = data)
+
+g7 <-
+  mgcv::gam(formula, family = Gamma(link = "identity"), data = data)
+g8 <-
+  mgcv::gam(formula, family = Gamma(link = "inverse"), data = data)
+g9 <-
+  mgcv::gam(formula, family = Gamma(link = "log"), data = data)
+
+formula2 <-
+  log(symptom + 1) + 1 ~ wifi_1 + wifi_2 + wifi_3 +  bluetooth_1 + bluetooth_2 +
+  bluetooth_3 +  communication_1 + communication_2 + communication_3 + 
+  friends_1 + friends_2 + friends_3 + activity_1 + activity_2 + activity_3
+
+g10 <-
+  mgcv::gam(formula2,
+            data = data,
+            family = gaussian(link = "identity"))
+g11 <-
+  mgcv::gam(formula2, family = gaussian(link = "inverse"), data = data)
+g12 <-
+  mgcv::gam(formula2, family = gaussian(link = "log"), data = data)
+
+g13 <-
+  mgcv::gam(formula2,
+            family = Gamma(link = "identity"),
+            data = data)
+g14 <-
+  mgcv::gam(formula2, family = Gamma(link = "inverse"), data = data)
+g15 <-
+  mgcv::gam(formula2, family = Gamma(link = "log"), data = data)
+
+formula3 <-
+  log(symptom + 1) + 1 ~  bluetooth_1 + bluetooth_2 + 
+  bluetooth_3 +  communication_1 + communication_2 + communication_3 + 
+  activity_1 + activity_2 + activity_3
+
+g16 <-
+  mgcv::gam(formula3,
+            data = data,
+            family = gaussian(link = "identity"))
+g17 <-
+  mgcv::gam(formula3, family = gaussian(link = "inverse"), data = data)
+g18 <-
+  mgcv::gam(formula3, family = gaussian(link = "log"), data = data)
+
+g19 <-
+  mgcv::gam(formula3,
+            family = Gamma(link = "identity"),
+            data = data)
+g20 <-
+  mgcv::gam(formula3, family = Gamma(link = "inverse"), data = data)
+g21 <-
+  mgcv::gam(formula3, family = Gamma(link = "log"), data = data)
+
+AIC(
+  g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,g15,
+  g16,g17,g18,g19,g20,g21
+)
+```
+
+Los resultados del modelo general con diferentes familias y funciones link son atroces. Esta situación ya ha ocurrido alguna vez durante las prácticas y probablemente indica que el problema que estamos tratando no es una regresión, sino una clasificación.
+
+### Modelado del problema como clasificación
+
+Los resultados que aquí aparecen en el código son la fase final del calibrado de parámetros y de la prueba con varios modos de preprocesamiento con caret (escalado, centrado, boxcox). Por brevedad solo se han incluido los que dan el resultado definitivo.
+
+Lo primero que vamos a hacer es discretizar la variable de salida. Vamos a considerar dos clases: Cuando no hay sintomas y cuando los hay.
+
+```{r Discretización de la variable dependiente}
+dataC <- data
+
+discretize <- function(val) {
+  if (val == 0)
+    "NO"
+  else
+    "SI"
+}
+
+dataC$symptom = sapply(dataC$symptom, discretize)
+dataC$symptom = as.factor(dataC$symptom)
+
+dataC <- dataC[!duplicated(dataC), ]
+```
+
+Se puede ver que la variable dependiente es un factor, así que los algoritmos interpretarán el problema como una clasificación.
+
+Miramos la distribución de las clases:
+
+```{r Cuenta de elementos de clases}
+table(dataC$symptom)
+```
+
+Las clases están muy desbalanceadas, lo que puede dar lugar a que los algoritmos no generen buenos modelos.
+
+Vamos a balancear las clases de una forma simple, intentando igualar el número de elementos de la clase `NO` con la suma de todas las demás clases.
+
+
+```{r Balanceo de clases}
+dataC <- downSample(dataC, dataC$symptom)
+dataC$Class = NULL
+table(dataC$symptom)
+```
+
+Para modelar, vamos a probar algoritmos de minería que han dado buenos resultados en trabajos anteriores, para empezar, un K-vecinos que es el menos preciso pero muy sencillo y nos da una idea del rendimiento que se puede obtener.
+
+### Generación de modelos de minería para clasificar
+
+```{r Preparación de datos para caret}
+set.seed(7)
+
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+
+particion <-
+  createDataPartition(dataC$symptom, p = 0.7, list = FALSE)
+
+entrenamiento <- dataC[particion, ]
+validacion <- dataC[-particion, ]
+entrenamiento$Class <- NULL
+validacion$Class <- NULL
+
+fiveStats = function(...)
+  c (twoClassSummary(...), defaultSummary(...))
+control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  classProbs = TRUE,
+  summaryFunction = fiveStats,
+  returnResamp = "final",
+  allowParallel = TRUE
+)
+metrica <- "ROC"
+```
+
+```{r KNN, eval = FALSE}
+set.seed(7)
+
+grid_knn <- expand.grid(.k = c(3, 5, 10, 20, 30, 50, 100))
+
+fit.knn <-
+  train(
+    symptom ~ .,
+    data = entrenamiento,
+    method = "knn",
+    metric = metrica,
+    tuneGrid = grid_knn,
+    trControl = control
+  )
+saveRDS(fit.knn, file = "models/knn_1.rda")
+```
+
+```{r KNN: resultados, render=knit_print}
+fit.knn <- readRDS("models/knn_1.rda")
+predic_knn <- predict(fit.knn , newdata = validacion)
+confusionMatrix(predic_knn, validacion$symptom)
+fit.knn
+```
+
+Se ha obtenido un 0.64 de ROC. No parece que este dataset vaya a dar grandes rendimientos.
+
+Ahora probamos un XGBoost
+
+```{r XGBoost, eval = FALSE}
+set.seed(7)
+
+tune_grid <- expand.grid(
+  nrounds = c(700, 800, 900),
+  eta = c(0.1, 0.15),
+  max_depth = c(6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+fit.xgbTree <-
+  train(
+    x = (entrenamiento %>% dplyr::select(-symptom)),
+    y = entrenamiento$symptom,
+    trControl = control,
+    tuneGrid = tune_grid,
+    method = "xgbTree",
+    metric = metrica
+  )
+
+saveRDS(fit.xgbTree, file = "models/xgbTree_1.rda")
+```
+
+```{r XGBoost: resultados, render=knit_print}
+fit.xgbTree <- readRDS("models/xgbTree_1.rda")
+predic_xgbTree <-
+  predict(fit.xgbTree , newdata = (validacion %>% dplyr::select(-symptom)))
+confusionMatrix(predic_xgbTree, validacion$symptom)
+xgbTreeImp <- varImp(fit.xgbTree)
+print(xgbTreeImp)
+fit.xgbTree
+```
+
+Se ha obtenido un resultado muy interesante calibrando XGBoost. Es probable que sea el máximo que se pueda obtener de estos datos.
+
+A continuación un ADABoost, ya que los árboles funcionan bien.
+
+```{r ADABoost, eval = FALSE}
+set.seed(7)
+
+ada_grid <- expand.grid(
+  mfinal = c(11, 12, 13, 14, 15),
+  maxdepth = c(6, 7),
+  coeflearn = c("Breiman")
+  
+)
+
+fit.ada <- train(
+  symptom ~ .,
+  data = entrenamiento,
+  method = "AdaBoost.M1",
+  metric = metrica,
+  trControl = control,
+  tuneGrid = ada_grid,
+  verbose = FALSE
+)
+saveRDS(fit.ada, file = "models/ada_1.rda")
+```
+
+```{r ADABoost: resultados, render=knit_print}
+set.seed(7)
+
+fit.ada <- readRDS("models/ada_1.rda")
+predic_ada <-
+  predict(fit.ada , newdata = (validacion %>% dplyr::select(-symptom)))
+confusionMatrix(predic_ada, validacion$symptom)
+fit.ada
+```
+
+Adaboost tiene un rendimiento un poco peor que XGBoost como máxima, aunque quizás tenga mejor media o rango. Sin embargo es preocupante que aparezcan tantos falsos positivos y falsos negativos.
+
+La siguiente prueba será una SVM lineal.
+
+```{r SVM, eval = FALSE}
+set.seed(7)
+
+svm_grid <- expand.grid(C = seq(0.001, 0.02, length = 10))
+
+fit.svm <- train(
+  symptom ~ .,
+  data = entrenamiento,
+  method = "svmLinear",
+  trControl = control,
+  preProc = c("center", "scale"),
+  metric = metrica,
+  tuneGrid = svm_grid
+)
+saveRDS(fit.svm, file = "models/svm_1.rda")
+```
+
+```{r SVM: resultados, render=knit_print}
+fit.svm <- readRDS("models/svm_1.rda")
+predic_svm <-
+  predict(fit.svm, newdata = (validacion %>% dplyr::select(-symptom)))
+confusionMatrix(predic_svm, validacion$symptom)
+fit.svm
+```
+
+El rendimiento de este tipo de algoritmo parece menos apropiado para nuestros datos que los basados en árboles.
+
+Probamos también una regresión logística.
+
+```{r Regresión logística, render=knit_print}
+set.seed(7)
+
+fit.rl <-
+  train(
+    symptom ~ .,
+    data = entrenamiento,
+    method = "LMT",
+    metric = metrica,
+    preProc = c("center", "scale"),
+    trControl = control
+  )
+saveRDS(fit.rl, file = "models/rl_1.rda")
+predic_rl <- predict(fit.rl , newdata = validacion)
+confusionMatrix(predic_rl, validacion$symptom)
+fit.rl
+```
+
+El rendimiento es bajo, aunque la ejecución ha sido muy rápida comparada con el resto de algoritmos excepto k-vecinos. 
+
+Ahora se prueba una red neuronal.
+
+```{r Red Neuronal, eval = FALSE}
+set.seed(7)
+
+mlp_grid <- expand.grid(size = 5:9)
+
+fit.mlp <-
+  train(
+    symptom ~ .,
+    data = entrenamiento,
+    method = "mlp",
+    metric = metrica,
+    preProc = c("center", "scale"),
+    trControl = control,
+    tuneGrid = mlp_grid
+  )
+saveRDS(fit.mlp, file = "models/mlp_1.rda")
+```
+
+```{r Red Neuronal: resultados, render=knit_print}
+fit.mlp <- readRDS("models/mlp_1.rda")
+predic_mlp <- predict(fit.mlp , newdata = validacion)
+fit.mlp
+confusionMatrix(predic_mlp, validacion$symptom)
+```
+
+De nuevo, parece no adaptarse tan bien como los árboles de decisión.
+
+Y finalmente un Random Forest. Este algoritmo es fácil de calibrar y suele dar buen resultado.
+
+```{r Random Forest, eval = FALSE}
+set.seed(123)
+
+grid_rf <- expand.grid(mtry = c(2,3))
+
+fit.rf <-
+  train(
+    symptom ~ .,
+    data = entrenamiento,
+    method = "rf",
+    metric = metrica,
+    tuneGrid = grid_rf,
+    trControl = control
+  )
+saveRDS(fit.rf, file = "models/rf_1.rda")
+```
+
+```{r Random Forest: resultados, render=knit_print}
+fit.rf <- readRDS("models/rf_1.rda")
+predic_rf <- predict(fit.rf , newdata = validacion)
+confusionMatrix(predic_rf, validacion$symptom)
+print(varImp(fit.rf))
+fit.rf
+```
+
+El random forest también nos da una predicción bastante buena sin casi complicaciones. Definitivamente los árboles de decisión dan buenos resultados en este problema.
+
+### Comparación de modelos
+
+A continuación se muestra una comparativa de los modelos generados:
+
+```{r Comparativa de rendimiento, render=knit_print}
+modelos <- list(
+  xgbTree3 = readRDS("models/xgbTree_1.rda"),
+  ada = readRDS("models/ada_1.rda"),
+  rl = readRDS("models/rl_1.rda"),
+  rf = readRDS("models/rf_1.rda"),
+  svm = readRDS("models/svm_1.rda"),
+  knn = readRDS("models/knn_1.rda")
+)
+resultados <- resamples(modelos)
+dotplot(resultados)
+```
+
+# Conclusiones
+
+Como se puede ver en la comparativa la balanza se inclina en favor de los algoritmos basados en árboles de decisión, probablemente porque el espacio de los datos es bastante complicado con distribuciones muy sesgadas.
+
+Este problema se debe seguramente a que los datos provienen de contadores y los contadores suelen tener una distribución de tipo poisson.
+
+Los resultados de ROC, aunque están dentro de lo que se suele considerar "aceptable/fair", es decir, entre 0.7 y 0.8 no son nada satisfactorios de cara a una predicción. 
+En las matrices de confusión se puede ver una abundancia de falsos positivos y falsos negativos que harían el modelo poco practicable tal cual está planteado.
+
+Esto también puede deberse a que, tras eliminar duplicados y filas con ceros, el conjunto de datos ha quedado "pequeño" y eso no favorece la consecución de un modelo eficaz, sobre todo siendo datos con mala distribución.
+
+Analizando un poco los resultados, y con idea de seguir planteando mejores modelos, la importancia de las variables en XGBoost nos habla de que el factor más determinante serían las actividades comunes en el campus y la proximidad directa medida por el teléfono. 
+Además nos dice que las mejores variables son las de la semana anterior, lo que apunta a que el síntoma debe tener una incubación de 1 semana. 
+
+En el lado de las menos relevantes están las llamadas de teléfono y sms y parece razonable que una enfermedad no se pueda transmitir llamando por teléfono. Por otro lado parece que los sujetos no se comunican por teléfono con la misma gente con la que comparten actividades y proximidad.
+
+La relevancia de las columnas de wifi es baja. Esto se puede deber a que el algoritmo de clusterizado que hemos usado para calcular las ubicaciones no describe bien las ubicaciones reales. Es algo que hay que mejorar.
+
+```{r, render=knit_print}
+xgbTreeImp
+```
+
+Desde el punto de vista de los objetivos del trabajo, creo que se han satisfecho pues se ha mostrado como adaptar los datos para construir modelos de regresión y de clasificación, como trabajar con grafos de relaciones e interacciones aplicados al problema y maneras razonables de visualizar estos grafos.
+
+## Ampliaciones y mejoras
+
+Varios puntos se han quedado fuera del trabajo que podrían requerir atención en un futuro.
+
+Por un lado, la técnica descrita para construir matrices de exposición desde datos de móviles podría aplicarse de manera más amplia con mejores datos lo que seguramente beneficiaría la calidad del modelo.
+
+Por otro lado, sería necesario refinar la manera de contar las interacciones, ya que en el trabajo se ha dado por supuesto que todas cuentan lo mismo, pero resulta obvio que no es igual de representativo que haya 4 interacciones en un minuto que 4 a lo largo de 4 horas. Probablemente esta mala cualificación de las interacciones (medida de proximidad bluetooth, traza de wifi...) sea la causante de la extraña distribución de los datos y de que algunos sujetos tengan gran cantidad de lecturas, similares a outliers, que perjudican el cálculo de la exposición.
+
+Otro factor a mejorar es la calidad de las encuestas. En algunos de los papers asociados a estos datos se han generado modelos dinámicos capaces de imputar los datos de manera precisa. La aproximación a la imputación de datos en este trabajo es básica y se basa en asumciones demasiado elementales para dar buenos resultados.
+
+De cualquier manera, salvando estas áreas de mejora, creo que la estrategia es utilizable incluso con otros datos del mismo dataset, como otros síntomas o las preferencias musicales, políticas y de salud. Desde el punto de vista metodológico no hubieran aportando nada pues simplemente consisten en cambiar la variable que se usa para construir la matriz de exposición y replicar código, pero quizás hubieran arrojado modelos de mejor calidad.
+
+
+
+
+
+
+
+
+
+

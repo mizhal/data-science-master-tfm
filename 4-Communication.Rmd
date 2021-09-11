@@ -1,0 +1,248 @@
+---
+title: "Grafo de interacciones por llamadas y SMS"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+```{r setup-4, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Grafo de llamadas telefónicas y SMS
+
+Ahora se va a calcular el grafo de interacciones basado en las llamadas por télefono y SMS enviados entre los sujetos. El objetivo es combinar los dos indicios en una sola matriz de multi-grafo, ya que se considera que el impacto de ambos modos de comunicación es similar a efectos de síntomas de gripe. 
+
+Para otras cuestiones como salud u opiniones políticas podría ser interesante separar las dos matrices.
+
+```{r Librerías-4, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+library(glue)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+
+```{r Carga de datos-4}
+base_dir <- '../../datasets/SocialEvolution/'
+
+calls <- read.csv2(paste0(base_dir, 'Calls.csv'), sep = ',')
+sms <- read.csv2(paste0(base_dir, 'SMS.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+```{r render=lemon_print}
+str(calls)
+```
+
+```{r render=lemon_print}
+str(sms)
+```
+
+## Organizacion de los datos en la rejilla de semana
+
+Al igual que en los casos anteriores, se agregan los datos por semana, considerando las semanas basadas en el 30 de diciembre de 2007.
+
+```{r}
+# ultimo domingo de 2007 como fecha base para que las semanas sean regulares entre años
+base = parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+calls_time <- calls %>% mutate(
+               time = parse_date_time(time_stamp, "y-m-d H:M:S")
+             ) %>%
+             transmute(
+                weekday = wday(time), 
+                week = as.integer(round(difftime(time, base, units = "weeks"))),
+                year_week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time),
+                user_id.x = user_id,
+                user_id.y = dest_user_id_if_known,
+                weight = duration
+             ) %>% 
+             filter(year >= 2008) %>%
+             filter(!is.na(user_id.y)) %>% # destinatario desconocido
+             filter(user_id.x != user_id.y) # a si mismo
+```
+
+Ahora los SMS
+
+```{r}
+sms_time <- sms %>% mutate(
+               time = parse_date_time(time, "y-m-d H:M:S")
+             ) %>%
+             transmute(
+                weekday = wday(time), 
+                week = as.integer(round(difftime(time, base, units = "weeks"))),
+                year_week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time),
+                user_id.x = user.id,
+                user_id.y = dest.user.id.if.known,
+                weight = 1
+             ) %>% 
+             filter(year >= 2008) %>%
+             filter(!is.na(user_id.y)) %>% # destinatario desconocido
+             filter(user_id.x != user_id.y) # a si mismo
+```
+
+Una vez generadas las columnas temporales, usamos la semana para agregar.
+
+```{r}
+calls_by_week <- calls_time %>%
+                 group_by(week, user_id.x, user_id.y) %>%
+                 summarise(
+                   weight = sum(weight),
+                   .groups='drop'
+                 ) %>% ungroup()
+```
+
+```{r}
+sms_by_week <- sms_time %>%
+               group_by(week, user_id.x, user_id.y) %>%
+               summarise(
+                 weight = sum(weight), 
+                 .groups='drop'
+               ) %>% ungroup()
+```
+
+## Visualización de matrices de adyacencia
+
+Usamos el modo de visualización de matriz para ver quien habla con quién, y representamos la intensidad con puntos de diferente grosor.
+
+```{r fig.width=15, fig.asp=0.5}
+plots <- list()
+
+for (sel_week in 1:2) {
+  prox_week <-
+    calls_by_week %>% filter(week == 39 + sel_week) %>% dplyr::select(-week)
+  plots[[sel_week]] <-
+    ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+    geom_tile(aes(fill = weight)) +
+    geom_point(aes(size = weight)) +
+    lims(x = c(1, 84), y = c(1, 84)) +
+    labs(x = "Subject A",
+         y = "Subject B",
+         title = paste("Semana", 39 + sel_week))
+}
+
+wrap_plots(plots, ncol = 2)
+```
+
+```{r fig.width=15, fig.asp=0.5}
+plots <- list()
+
+for (sel_week in 1:2) {
+  prox_week <-
+    sms_by_week %>% filter(week == 39 + sel_week) %>% dplyr::select(-week)
+  plots[[sel_week]] <-
+    ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+    geom_tile(aes(fill = weight)) +
+    geom_point(aes(size = weight)) +
+    lims(x = c(1, 84), y = c(1, 84)) +
+    labs(x = "Subject A",
+         y = "Subject B",
+         title = paste("Semana", 39 + sel_week))
+}
+
+wrap_plots(plots, ncol = 2)
+```
+
+## Construcción de la rejilla combinada
+
+Como tenemos los datos de llamadas y de SMS en el mismo formato, podemos proceder a combinarlos. Mostramos los rangos de semanas que tiene cada tipo para tenerlo en cuenta al generar la rejilla vacía.
+
+```{r}
+glue("Llamadas: rango {paste(range(calls_by_week$week), collapse=',')}")
+glue("SMS: rango {paste(range(sms_by_week$week), collapse=',')}")
+```
+
+```{r render=lemon_print}
+communication_by_week <- calls_by_week %>%
+                         full_join(sms_by_week) %>%
+                         group_by(week, user_id.x, user_id.y) %>%
+                         summarise(
+                           weight = sum(weight),
+                           .groups = 'drop'
+                         )
+```
+Mostramos los datos combinados para saber el impacto que tiene la combinación. El efecto es pequeño y las llamadas siguen siendo más relevantes.
+
+```{r fig.width=15, fig.asp=0.5}
+plots <- list()
+
+for (sel_week in 1:2) {
+  prox_week <-
+    communication_by_week %>% filter(week == 39 + sel_week) %>% dplyr::select(-week)
+  plots[[sel_week]] <-
+    ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+    geom_tile(aes(fill = weight)) +
+    geom_point(aes(size = weight)) +
+    lims(x = c(1, 84), y = c(1, 84)) +
+    labs(x = "Subject A",
+         y = "Subject B",
+         title = paste("Semana", 39 + sel_week))
+}
+
+wrap_plots(plots, ncol = 2)
+```
+
+Ahora construimos la rejilla vacía para imputar los datos faltantes.
+
+```{r render=lemon_print}
+grid.weeks <- 0:78
+grid.users <- subjects$user_id
+communication_full_grid <- expand.grid(week = grid.weeks, user_id.x = grid.users, user_id.y = grid.users)
+communication_full_grid$weight = 0
+
+communication_full_grid <- communication_full_grid %>%
+                  full_join(communication_by_week) %>%
+                  group_by(week, user_id.x, user_id.y) %>%
+                  summarise(weight = max(weight), .groups = 'drop') %>%
+                  arrange(week, user_id.x, user_id.y)
+```
+
+Convertimos la lista de arcos en matriz de adyacencia para usarla en la construcción de la tabla final.
+
+```{r}
+communication_adj_matrix <- communication_full_grid %>%
+                    pivot_wider(names_from = user_id.y, 
+                                values_from = weight, 
+                                values_fill = 0)
+write.csv2(
+  communication_adj_matrix, "communication_adj_matrix.csv", 
+  row.names = FALSE)
+```
+

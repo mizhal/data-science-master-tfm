@@ -1,0 +1,207 @@
+---
+title: "Grafo de proximidad por Bluetooth"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-3, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Grafo de interacción por proximidad (Bluetooth)
+
+La siguiente matriz de adyacencia a construir es la de interacción por Bluetooth. Estos datos son muy frecuentes y ya representan directamente pares de usuarios, así que la normalización de la rejilla y la construcción de la lista de arcos es sencilla.
+
+```{r Librerías-3, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+
+```{r Carga de datos-3}
+base_dir <- '../../datasets/SocialEvolution/'
+
+proximity <- read.csv2(paste0(base_dir, 'Proximity.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+```{r render=lemon_print}
+str(proximity)
+```
+
+
+Inicialmente eliminamos los pares de proximidad que no tienen alguno de los dos extremos o los que los dos extremos son iguales, pues no podemos imputar el dato faltante.
+
+```{r}
+proximity <- proximity %>% 
+  filter(!is.na(user.id)) %>% 
+  filter(!is.na(remote.user.id.if.known)) %>%
+  filter(user.id != remote.user.id.if.known)
+```
+
+Agrupamos por tiempo, con el mismo criterio que en caso de las wifis, generando las semanas desde un día inicial. Primero generamos las columnas de tiempo y luego agrupamos por semana.
+
+```{r}
+# ultimo domingo de 2007 como fecha base para que las semanas sean regulares entre años
+base = parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+proximity_time <- proximity %>% mutate(
+               time = parse_date_time(time, "y-m-d H:M:S")
+             ) %>%
+             mutate(
+                weekday = wday(time), 
+                week = as.integer(round(difftime(time, base, units = "weeks"))),
+                year_week = week(time),
+                hour = hour(time),
+                month = month(time), 
+                year = year(time),
+                year_day = yday(time)
+             ) %>% filter(year >= 2008)
+```
+
+
+```{r}
+proximity_by_week <- proximity_time %>% 
+                     group_by(user.id, remote.user.id.if.known, week) %>%
+                      summarize(
+                        count = n(),
+                        .groups = 'drop'
+                      )
+write.csv2(proximity_by_week, "proximity_by_week.csv", row.names = FALSE)
+```
+
+Esta es una lista de arcos entre los sujetos del experimento, los arcos son el número de reportes de coincidencia del bluetooth por semana. En realidad son varias matrices de adyacencia, una por semana. Es una matriz incompleta, pues no contiene todos los pares de usuarios ni todas las semanas. Al igual que con la wifi, será necesario generar una rejilla vacía pero completa y combinar los datos.
+
+```{r render=lemon_print}
+proximity_by_week <- proximity_time %>% 
+                     filter(year >= 2008) %>%
+                     group_by(user.id, remote.user.id.if.known, week) %>%
+                      summarize(
+                        count = n(),
+                        .groups = 'drop'
+                      ) %>% ungroup()
+
+proximity_by_week <- proximity_by_week %>%
+                     dplyr::transmute(
+                       week = week,
+                       user_id.x = user.id,
+                       user_id.y = remote.user.id.if.known,
+                       weight = count
+                     ) %>% filter(user_id.x != user_id.y)
+
+grid.weeks <- 2:81
+grid.users <- subjects$user_id
+bluetooth_full_grid <- expand.grid(week = grid.weeks, 
+                                   user_id.x = grid.users, 
+                                   user_id.y = grid.users)
+bluetooth_full_grid$weight = 0
+
+bluetooth_full_grid <- bluetooth_full_grid %>%
+                  full_join(proximity_by_week) %>%
+                  group_by(week, user_id.x, user_id.y) %>%
+                  summarise(weight = max(weight), .groups = 'drop') %>% 
+                  arrange(week, user_id.x, user_id.y)
+```
+
+Como ya tenemos la lista de interacciones, podemos presentar el grafo de contactos:
+
+```{r warning=FALSE}
+suppressPackageStartupMessages(library(network))
+
+sel_week <- 40
+
+edges <- proximity_by_week %>%
+  ungroup %>%
+  filter(week == sel_week) %>%
+  dplyr::select(user_id.x, user_id.y, weight) %>%
+  rowwise() %>%
+  transmute(from = user_id.x,
+            to = user_id.y,
+            weight = weight) %>%
+  group_by(from, to) %>%
+  summarise(weight = mean(weight), .groups = 'drop') %>%
+  ungroup %>%
+  filter(weight >= mean(weight)) ## pintamos solo las relaciones mas relevantes
+
+nodes <- unique(proximity_by_week %>% dplyr::select(user_id.x))
+
+routes_network <-
+  network(
+    edges,
+    vertex.attr = nodes,
+    matrix.type = "edgelist",
+    ignore.eval = FALSE
+  )
+plot(
+  routes_network,
+  vertex.cex = 1,
+  mode = "circle",
+  main = paste0("Semana ", sel_week)
+)
+```
+
+Estas matrices de contacto son muy densas. Solo hemos representado los valores de confluencia más altos para que el gráfico sea informativo. Como valores más altos se ha considerado los mayores que la media.
+
+Generamos la matriz de adyacencia de todas las semanas y guardamos:
+
+```{r}
+proximity_adj_matrix <- bluetooth_full_grid %>%
+                    pivot_wider(names_from = user_id.y, values_from = weight, values_fill = 0)
+write.csv2(proximity_adj_matrix, "proximity_adj_matrix_by_week.csv", row.names = FALSE)
+```
+
+
+Visualizamos la matriz de interacciones bluetooth mediante un gráfico raster de la matriz de adyacencia:
+
+```{r fig.width=15, fig.asp=0.5}
+plots <- list()
+
+for (sel_week in 1:2) {
+  prox_week <-
+    proximity_by_week %>% filter(week == 39 + sel_week) %>% dplyr::select(-week)
+  plots[[sel_week]] <-
+    ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+    geom_tile(aes(fill = weight)) +
+    labs(x = "Subject A",
+         y = "Subject B",
+         title = paste("Semana", 39 + sel_week)) +
+    lims(x = c(1, 84), y = c(1, 84))
+}
+
+wrap_plots(plots, ncol = 2)
+```
+
+Se puede ver que hay usuarios en los bordes (sobre el id 80) que no tienen datos.
+
+

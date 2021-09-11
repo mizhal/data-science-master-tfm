@@ -1,0 +1,201 @@
+---
+title: Estudio de dinámicas sociales y su impacto en el contagio de la gripe en una
+  pequeña comunidad mediante teléfonos móviles
+date: Diciembre 2020
+subtitle: Master Data Science y Big Data aplicados a la Economía y a la Administración y Dirección de Empresas
+author: "Miguel Pérez Barrero"
+geometry: "left=3cm,right=3cm,top=2.5cm,bottom=2.5cm"
+header-includes:
+  - \usepackage[spanish]{babel}
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+    number_sections: yes
+    includes:
+      before_body: before_body.tex
+  html_document:
+    self_contained: no
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+indent: true
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+  p {
+    text-indent: 0.5cm;
+  }
+</style>
+
+\newpage
+\pagenumbering{arabic} 
+
+```{r setup, include=FALSE}
+library(lemon)
+knit_print.data.frame <- lemon_print
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Resumen
+
+Partiendo de una base de datos recogida durante un experimento realizado en una residencia universitaria, se busca relacionar los comportamientos sociales con la propagación de la gripe en dicha comunidad, así como otros factores recogidos. En este contexto, los comportamientos se monitorizan mediante una aplicación de móvil y encuestas periódicas.
+
+Los datos disponibles de los sujetos del estudio son tanto:
+  - de naturaleza estática: planta del edificio donde se alojan, actividades universitarias en las que participan, 
+  - como de naturaleza dinámica o temporal: personas cercanas detectadas mediante bluetooth, wifis a las que se conectan, llamadas y sms entre ellos y otros datos recogidos mediante encuestas.
+Con los datos disponibles se busca tanto llegar a ajustar un modelo que relacione los comportamientos observados desde los móviles y las encuestas con un síntoma de la gripe. 
+
+# Descripción de la base de datos
+
+* La base de datos se compone de 13 archivos CSV o tablas. Cada archivo recoge las entradas sobre un tema específico o las lecturas de sensores en el caso de los datos obtenidos desde el móvil.
+* La base de datos original puede obtenerse en:
+    + http://realitycommons.media.mit.edu/socialevolution2.html. 
+
+## Ficheros de la base de datos con sus columnas
+
+1. Llamadas (Calls.csv)
+    + user_id: identificador seudonimizado del sujeto experimental.
+    + time_stamp: marca de tiempo del inicio de la llamada.
+    + duration: duración de la llamada
+    + dest_user_id_if_known: si la llamada es a otro sujeto experimental, el id seudonimizado del receptor.
+    + dest_phone_hash: teléfono del destinatario seudonimizado
+2. Mensajes de texto antiguos SMS (SMS.csv)
+    + user.id: identificador seudonimizado del sujeto experimental.
+    + time: marca de tiempo del momento del envío del mensaje.
+    + incoming: si se trata de un mensaje enviado (0) o recibido por el terminal (1)
+    + dest.user.id.if.known: si el destinatario es otro sujeto experimental, su id seudonimizado
+    + dest.phone.hash: teléfono del destinatario seudonimizado
+3. Proximidad de otros dispositivos mediante Bluetooth (Proximity.csv)
+    + user.id: identificador seudonimizado del sujeto experimental.
+    + remote.user.id.if.known identificador seudonimizado de otro sujeto experimental detectado en la zona cercana.
+    + time: marca de tiempo del escaneo de proximidad.
+    + prob2: probabilidad de que los dos sujetos estén en el mismo piso del edificio.
+4. Conexión Wi-Fi (WLAN2.csv)
+    + user_id: identificador seudonimizado del sujeto experimental.
+    + time: marca de tiempo en la que se consulta la conexión a una wifi.
+    + wireless_mac: identificador único de la red wifi (dirección mac o ssid) seudonimizado.
+    + strength: fuerza de la señal (permite computar la cercanía al punto wifi)
+    + unix_time: el mismo dato que “time” pero en formato de segundos desde el 1-1-1970.
+5. Encuesta de relaciones personales (RelationshipsFromSurveys.csv)
+    + id.A: identificador seudonimizado del sujeto que rellena la encuesta
+    + id.B: identificador seudonimizado del sujeto sobre el que pregunta la encuesta
+    + relationship: tipo de relación entre estas “Amigo Cercano”, “Hablan de política”, “Se etiquetan en Facebook”, “Hablan por Twitter”, “Socializan dos veces por semana”.
+    + survey.date: día de realización de la encuesta
+6. Actividades escolares (Activities.csv)
+    + user.id: identificador seudonimizado del sujeto experimental.
+    + campus.organization: identificador de la actividad
+    + survey.month: mes de realización de la encuesta
+7. Síntomas de gripe (FluSymptoms.csv)
+    + user_id: identificador seudonimizado del sujeto experimental.
+    + time: marca de tiempo de la encuesta
+    + sore.throath.cough: tos de garganta con dolor
+    + runnynose.congestion.sneezing: moqueo, congestión o estornudos
+    + fever: fiebre
+    + nausea.vomiting.diarrhea: nausea, vómitos o diarrea
+    + sad.depressed: tristeza o depresión
+    + often.stressed: estrés
+8. Hábitos de salud (Health.csv)
+    + No se va a utilizar
+9.	Política (Politics.csv)
+    + No se va a utilizar
+10.	Preferencias musicales: conocimiento del gusto de otro sujeto (MusicGenreAwareness.csv)
+    + No se va a utilizar
+11.	Preferencias musicales: implicación con un género musical (MusicGenreImmersion.csv)
+    + No se va a utilizar
+12.	Preferencias musicales: preferencia por un tipo de música (MusicGenrePreference.csv)
+    + No se va a utilizar
+13.	Tabla de sujetos (Subjects.csv)
+    + user_id: identificador de sujeto
+    + year_school: año de universidad (novato, junior, senior,…)
+    + floor: planta de la residencia en la que vive.
+    
+```{r, child=c('1-Intro.Rmd', '2-Wlan.Rmd', '3-Bluetooth.Rmd', '4-Communication.Rmd', '5-Friendship.Rmd', '6-Activity.Rmd', '7-Symptoms.Rmd', '8-Analysis.Rmd')}
+```
+
+# Tecnología y librerías utilizadas
+
+Se ha utilizado R en el entorno R Studio por ser más adecuado a la generación de informes con RMarkdown.
+Las librerías de R utilizadas son las siguientes:
+
+```{r render=lemon_print, echo=FALSE}
+plic <- data.frame(installed.packages())
+plic <-
+  subset(
+    plic,
+    plic$Package %in% c(
+      'CCA',
+      'caret',
+      'corrplot',
+      'data.table',
+      'doParallel',
+      'dplyr',
+      'gdata',
+      'ggplot2',
+      'glue',
+      'graphics',
+      'kohonen',
+      'lemon',
+      'lmtest',
+      'lubridate',
+      'mgcv',
+      'nnet',
+      'patchwork',
+      'psych',
+      'resample',
+      'rpart',
+      'scales',
+      'tibble',
+      'tidyr',
+      'visdat'
+    )
+  )
+plic <- plic[, c("Package", "Version")]
+rownames(plic) <- NULL
+plic
+```
+
+
+# Bibliografía
+
+1. Manuales del Master en Data Science y Big Data aplicados a la Economía y
+a la Administración y Dirección de Empresas
+
+2. Modeling the Co-evolution of Behaviors and Social Relationships Using Mobile Phone Data
+    + Wen Dong1, Bruno Lepri1,2 and Alex (Sandy) Pentland1
+    + MIT Media Laboratory
+  
+3. Graph-Coupled HMMs for Modeling the Spread of Infection
+    + Wen Dong, Alex Pentland
+    + MIT. Media Laboratory
+  
+4. Network analysis with R
+    + https://www.jessesadler.com/post/network-analysis-with-r/
+  
+5. Static and dynamic network visualization with R
+    + https://kateto.net/network-visualization
+  
+6. RSSI-based Localization Zoning using K-Mean Clustering
+    + https://iopscience.iop.org/article/10.1088/1757-899X/705/1/012038/pdf
+  
+7. Introduction Self-Organizing Maps (SOM)
+    + https://rpubs.com/inayatus/som
+  
+

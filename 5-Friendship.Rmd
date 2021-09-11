@@ -1,0 +1,257 @@
+---
+title: "Grafo de amistad"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-5, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Grafo de amistad
+
+La encuesta sobre relaciones incluye varios grados de relación. Para modelar la amistad pensando en el impacto en los síntomas de gripe, las dos relaciones más relevantes serían `CloseFriend` y `SocialiceTwicePerWeek`. Sobre las filas de estas dos categorías vamos a construir la matriz de adyacencia del grafo de amistad.
+
+```{r Librerías-5, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(lubridate)
+library(glue)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+```{r Carga de datos-5}
+base_dir <- '../../datasets/SocialEvolution/'
+
+relationships <- read.csv2(
+  paste0(base_dir, 'RelationshipsFromSurveys.csv')
+  , sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+```{r render=lemon_print}
+str(relationships)
+```
+
+```{r}
+levels(relationships$relationship)
+```
+
+```{r}
+levels(relationships$survey.date)
+```
+
+Aunque la fecha viene con dia, no hay más de una encuesta por mes, así que seguiremos como en la matriz de actividades, ordenando los datos por mes para llevarlos luego a semanas.
+De nuevo tenemos datos que faltan en los meses, y haremos la misma suposición de que las cosas no cambian en los meses intermedios.
+
+## Construcción del grafo por semanas
+
+De todas las relaciones incluidas en el dataset, solo vamos a usar "CloseFriends" y "SocializeTwicePerWeek", que son más relevantes para la transmisión de enfermedades.
+
+```{r}
+relationships <- relationships %>%
+                   mutate(
+                     time = parse_date_time(survey.date, 'y-m-d'),
+                     year = year(time)
+                   ) %>%
+                   filter(year >= 2008)
+
+friendship_time <- relationships %>%
+                   filter(relationship %in% c(
+                     "CloseFriend", 
+                     "SocializeTwicePerWeek"
+                   )) %>%
+                   transmute(
+                      year = year,
+                      month = month(time),
+                      user_id.x = id.A,
+                      user_id.y = id.B,
+                      weight = 1
+                   ) %>% 
+                   filter(!is.na(user_id.y)) %>% # destinatario desconocido
+                   filter(user_id.x != user_id.y) %>% # a si mismo
+                   group_by(year, month, user_id.x, user_id.y) %>%
+                   summarize(
+                     weight = sum(weight),
+                     .groups = 'drop'
+                   )
+```
+
+Ahora es necesario imputar los meses que faltan para poder aplicar la multiplicación de matrices de manera sencilla. Para ello creamos una asignación entre los meses originales y los que se copiarán para rellenar la rejilla de meses, al igual que se hizo para *Actividades*.
+
+```{r render=lemon_print}
+# "2008-09-09" "2008-10-19" "2008-12-13" "2009-03-05" "2009-04-17" "2009-05-18"
+month_grid <- data.frame(
+  year         = c(2008, 2008, 2008, 2008, 2008, 2008, 2009, 2009, 2009),
+  month        = c(   9,   10,   10,   12,   12,   12,    3,    4,    5),
+  year.filled  = c(2008, 2008, 2008, 2008, 2009, 2009, 2009, 2009, 2009),
+  month.filled = c(   9,   10,   11,   12,    1,    2,    3,    4,    5)
+)
+month_grid
+```
+
+Hacemos el cruce con los datos originales para que se copien los valores en los huecos vacíos.
+
+```{r render=lemon_print}
+friendship_full_months <- month_grid %>%
+                          left_join(
+                            friendship_time,
+                            by = c('year', 'month')
+                          ) %>% arrange(year, month.filled, month)
+```
+Se puede ver como la cuenta de elementos coincide en los meses que han sido rellenados con el mismo de origen.
+
+Lo siguiente es organizar el dataset para que solo quede una fila por año y mes.
+
+```{r render=lemon_print}
+friendship_full_months <- friendship_full_months %>% transmute(
+  year = year.filled,
+  month = month.filled,
+  user_id.x = user_id.x,
+  user_id.y = user_id.y,
+  weight = weight
+)
+```
+
+Después tenemos que añadir las semanas siguiendo el mismo proceso, generar una rejilla de semana y luego hacer un left join con los datos originales para que se dupliquen.
+
+```{r render=lemon_print}
+# ultimo domingo de 2007 como fecha base para que las semanas sean regulares entre años
+base = parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+norm_week <- function(time) {
+  as.integer(round(difftime(time, base, units = "weeks")))
+}
+
+month_from <- function(norm_week) {
+  month(base + weeks(norm_week))
+}
+
+year_from_norm_week <- function(norm_week) {
+  year(base + weeks(norm_week))
+}
+
+weeks <-
+  norm_week(
+    parse_date_time('2008.9', 'y.m')
+  ):norm_week(
+    parse_date_time('2009.5', 'y.m')
+  )
+user_ids <- unique(subjects$user_id)
+
+friendship_full_grid <- data.frame(week = weeks)
+friendship_full_grid$year = year_from_norm_week(friendship_full_grid$week)
+friendship_full_grid$month = month_from(friendship_full_grid$week)
+
+friendship_full_grid <- friendship_full_grid %>%
+  left_join(friendship_full_months,
+            by = c('year', 'month')) %>% arrange(year, month, week)
+```
+
+En esa cuenta se puede ver que coinciden las cifras de los datos que han sido copiados de cada mes a las semanas.
+
+Dejamos solo las columnas relevantes y quitamos algún NA que se había generado por no acertar con las semanas inicial y/o última.
+
+```{r render=lemon_print}
+friendship_full_grid <- friendship_full_grid %>%
+                        transmute(
+                          week = week,
+                          user_id.x = user_id.x,
+                          user_id.y = user_id.y,
+                          weight = weight
+                        ) %>% filter(!is.na(user_id.x))
+str(friendship_full_grid)
+```
+
+Lo que nos falta ahora son los pares de usuarios ausentes, los que tendrían 0 en *weigth*.
+Para ello es necesario crear una rejilla con todo a ceros y combinarla con los datos reales, como hemos hecho antes.
+
+```{r render=lemon_print}
+user_ids <- unique(subjects$user_id)
+friendship_empty_grid <- expand.grid(
+    week = unique(friendship_full_grid$week), 
+    user_id.x = user_ids, 
+    user_id.y = user_ids
+  ) %>% arrange(week, user_id.x, user_id.y) %>% 
+  ungroup()
+
+friendship_empty_grid$weight = 0
+```
+
+```{r render=lemon_print}
+friendship_edge_list <- friendship_empty_grid %>%
+                        full_join(friendship_full_grid) %>%
+                        group_by(week, user_id.x, user_id.y) %>%
+                        summarise(weight = max(weight)) %>%
+                        ungroup() %>% arrange(week, user_id.x, user_id.y)
+table(friendship_edge_list$weight)
+```
+```{r render=lemon_print}
+table(friendship_full_grid$weight)
+```
+
+Con las tablas de contingencia se comprueba que solo se han añadido los ceros y no se han modificado los datos originales.
+
+Ahora que tenemos las listas de arcos, construimos la matriz de adyacencia del grafo de amistades.
+
+```{r}
+friends_adj_matrix <- friendship_edge_list %>%
+  pivot_wider(names_from = user_id.y,
+              values_from = weight,
+              values_fill = 0)
+write.csv2(friends_adj_matrix, "friends_adj_matrix.csv", row.names = FALSE)
+```
+
+Y también podemos hacer un plot similar a los que hemos hecho con las otras matrices.
+
+```{r fig.width=15, fig.asp=0.5}
+plots <- list()
+
+for (sel_week in 1:2) {
+  prox_week <-
+    friendship_edge_list %>% 
+    filter(week == 40 + 4 * sel_week) %>% 
+    dplyr::select(-week)
+  plots[[sel_week]] <-
+    ggplot(prox_week, aes(x = user_id.x, y = user_id.y)) +
+    geom_tile(aes(fill = weight)) +
+    lims(x = c(1, 84), y = c(1, 84)) +
+    labs(x = "Subject A",
+         y = "Subject B",
+         title = paste("Semana", 40 + 4 * sel_week))
+}
+
+wrap_plots(plots, ncol = 2)
+```
+
+Se vislumbra poco movimiento, poco cambio en las amistades, aunque también es porque no tenemos tantas encuestas.
+
+

@@ -1,0 +1,362 @@
+---
+title: "Generación del grafo de interacciones por wifi"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-2, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Librerías-2, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(visdat)
+library(data.table)
+library(graphics)
+library(tibble)
+library(resample)
+library(patchwork)
+library(kohonen)
+library(gdata)
+library(lubridate)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+Cargamos los datos generados en el apartado anterior, y los preparamos eliminando las columnas que no son relevantes para reducir dimensión y clusterizar.
+
+```{r Carga de datos-2}
+base_dir <- '../../datasets/SocialEvolution/'
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+
+positions_wifi_space <- read.csv("positions_wifi_space.csv")
+to_cluster <- positions_wifi_space
+to_cluster$position_id <- NULL
+to_cluster$unix_time <- NULL
+to_cluster$time <- NULL
+to_cluster$user_id <- NULL
+```
+
+## Caracterización de la nube de puntos
+
+Visualizamos la varianza de las dimensiones. Esto nos permitirá tener una idea de que algoritmo puede ser mejor para clusterizar.
+
+```{r Varianza de las dimensiones, fig.height=5}
+barplot(colVars(to_cluster))
+```
+
+Se puede ver que hay mucha diferencia en las varianzas de las dimensiones. En estos casos K-medias no suele funcionar muy bien porque busca "esferas" alrdededor de los puntos y en algunas dimensiones no hay datos como para una esfera.
+
+Además del problema de reducir dimensiones y clusterizar, personalmente me siento más seguro si puedo visualizar de alguna manera este espacio de 36 dimensiones. Las técnicas basadas en scatterplots o uso de simbolos y pseudocolor en gráficas 2D y 3D son demasiado limitadas para trabajar con 36 dimensiones, además de que requieren un gran ordenador. 
+
+Por otro lado, los datos de intensidades de señal respecto a puntos fijos son intrínsecamente geométricos, o por lo menos muy similares ya que representan distancias en el mundo real. Se ven afectados por obstáculos y por perturbaciones electromagnéticas, con lo que una aproximación púramente geométrica quedaría destrozada por dichos "ruidos". Por ello es necesario una solución que pueda representar estas perturbaciones de manera robusta.
+
+Una técnica que proporciona todas estas capacidades a la vez es el SOM, el Mapa Autoorganizativo de Kohonen. Es un tipo de red neuronal que realiza una proyección "cartográfica" de los datos de entrada sobre una rejilla en dos dimensiones. La rejilla como tal es la última capa de neuronas y los valores que se van acumulando en cada neurona tras el entrenamiendo son los vectores en 36 dimensiones que mejor recubren la "nube de puntos" que no podemos ver.
+
+De esta manera se adapta a las zonas muy pobladas de puntos y a las poco densas de una forma que K-means no puede hacer.
+
+Además esta técnica realiza una *cuantización" del espacio, que es una primera aproximación al clusterizado. A pesar de eso, es interesante volver a clusterizar las neuronas entre sí para manejar un número más pequeño de ubicaciones de cara a las operaciones posteriores de grafos entre sujetos.
+
+Visualizemos pues el espacio de las wifis con un Mapa de Kohonen,
+
+```{r eval=FALSE}
+map <- som(as.matrix(to_cluster), 
+           somgrid(xdim = 100, ydim = 100, topo = c("hexagonal")))
+```
+
+```{r eval=FALSE, echo=FALSE}
+saveRDS(map, "WIFI_SOM.RData")
+```
+
+```{r echo=FALSE}
+map = readRDS("WIFI_SOM.RData")
+```
+
+```{r fig.width = 10, fig.asp=1}
+plot(map, type = 'mapping', 
+     main="Asignación de muestras a los 'cuantos' de SOM")
+```
+En esta gráfica se muestra la asignación de los "puntos" originales, que habíamos construido limpiando las wifis no relevantes y agrupando por bloques de tiempo.
+
+Afortunadamente, se muestran agrupaciones/clusters en forma de islas más densas y de zonas poco densas de "playa" alrededor. Esto me da más confianza acerca de la existencia de ubicaciones marcadas en las que los sujetos están conectados a las mismas wifis. Esto confirma la intuición de que los datos de señales wifi tienen un reflejo en un espacio físico.
+
+A continuación hacemos clusters sobre el propio mapa SOM, de tal manera que se trabaje con un número razonable de "ubicaciones". Solo por recordar, no disponemos de las ubicaciones reales del experimento en el dataset, por cuestiones de privacidad, así que tenemos que intuirlas a través de los datos.
+
+```{r}
+set.seed(7)
+
+error <- NULL
+k_max <- 40
+
+for (i in 2:k_max)
+{
+  error[i] <- sum(
+    kmeans(map$codes[[1]], centers = i, iter.max = 100, nstart = 10)$withinss
+  )
+}
+
+plot(1:k_max, error, type="b", xlab="Cantidad de Cluster", ylab="Suma de error")
+```
+
+Parece que la rodilla está en 10 clusters, a partir de ahí añadir más clusters solo nos da una pequeña ganancia en el error. 
+
+Vamos a usar ese valor de 10 para construir el modelo final y además mostraremos el mapa con los clusters y los puntos originales.
+
+```{r fig.width = 10, fig.asp=1}
+set.seed(8)
+k <- 10
+som.cluster.k <- kmeans(
+  map$codes[[1]], 
+  centers = k, 
+  iter.max = 100, 
+  nstart = 10)$cluster
+
+plot(map,
+     type = 'mapping',
+     keepMargins = F,
+     bgcol = rainbow(10)[som.cluster.k],
+     bg = 0,
+     main = 'Mapa con clusters')
+add.cluster.boundaries(map, som.cluster.k)
+```
+
+Se puede ver que los clusters "densos" marcados en negro se agrupan y atraen parte de la zona de alrededor.
+Pienso que la distribución que se muestra con 10 zonas es razonable.
+
+Con estos 10 clusters vamos a codificar todas las trazas originales de ubicación wifi. Para esto, se etiqueta la tabla de posiciones_wifi con el resultado del cluster que corresponde.
+
+## Etiquetado de ubicaciones
+
+```{r Creación del conjunto etiquetado con las ubicaciones}
+wifi_pos_labeled <- positions_wifi_space
+wifi_pos_labeled$location <- som.cluster.k[map$unit.classif]
+saveRDS(wifi_pos_labeled, "wifi_pos_labeled.RData")
+write.csv(wifi_pos_labeled, "wifi_with_location.csv", row.names = FALSE)
+```
+
+Vemos el porcentaje de puntos en cada ubicación por hacernos una idea y por verificar que son sitios diferentes. Al ser sitios diferentes se espera que tengan diferente número de puntos.
+
+```{r message=FALSE, fig.width=5}
+por_ubicacion <- wifi_pos_labeled %>% 
+  group_by(location) %>% 
+  summarise(sum = n())
+pie(por_ubicacion$sum)
+```
+
+Vamos a explorar la distribución temporal de los eventos de wifi, para ello anotamos la tabla con columnas temporales: año, mes, día, semana relativa, semana del año y otras que nos ayuden a decidir cual será la rejilla temporal que usaremos para agregar todos los datos de cara al modelo compuesto final.
+
+Como detalle especial, la columna de semanas no se genera como la semana ordinal del año.
+Se genera como la diferencia en semanas entre la fecha de la fila y una fecha inicial.
+Esto se hace porque el experimento abarca más de un año y la semana ordinal podría repetirse. 
+
+Además usar una misma fecha base nos va a permitir poner todos los datasets en la misma rejilla temporal, independientemente de cuando empiezan a tomarse los datos.
+
+```{r}
+# ultimo domingo de 2007 como fecha base para que las semanas sean 
+# regulares entre años
+base <- parse_date_time('2007/12/30 00:00', 'y-m-d H:M')
+
+time_distibution_wlan <- wifi_pos_labeled  %>% 
+  mutate(time = parse_date_time(time, "y-m-d H:M:S")) %>%
+  mutate(
+    weekday = wday(time),
+    week = as.integer(round(difftime(time, base, units = "weeks"))),
+    year_week = week(time),
+    hour = hour(time),
+    month = month(time),
+    year = year(time),
+    year_day = yday(time)
+  ) %>% filter(year >= 2008) %>% arrange(week, user_id)
+```
+
+Es interesante hacer un resumen informativo de donde suelen estar los usuarios en los diferentes momentos del día. Para evitar alteraciones debidas a los diferentes momentos del curso, vamos mirando los perfiles limitados por semana. Si no hacemos esta limitación por semana, los perfiles se aplanan y no dan información característica de cada ubicación.
+
+Esto es, supongo, porque el tiempo de uso de las diferentes estancias del Campus se iguala a medida que va pasando más tiempo.
+
+```{r}
+plots <- list()
+for (loc in 1:10) {
+  per_hour <- time_distibution_wlan %>%
+    dplyr::select(user_id, location, week, year_week, weekday, hour) %>%
+    distinct(user_id, location, week, year_week, weekday, hour) %>%
+    filter(location == loc) %>%
+    filter(year_week == 2)
+  plots[[loc]] <- ggplot(per_hour, aes(x = hour)) +
+    geom_histogram(color = "black",
+                   fill = "white",
+                   binwidth = 1) +
+    xlab("Hora") +
+    ylab("Visitas") +
+    ggtitle(paste0("Ubicación ", loc))
+}
+
+wrap_plots(plots)
+```
+
+Se pueden observar diferencias entre las ubicaciones, algunas notables.
+
+* La ubicación 1 es más frecuentada por las noches aunque tiene gente por el día, es probable que sea un lugar cercano a los dormitorios o un área comun.
+* La dos es más frecuentada hacia el centro del día, pueden ser clases u oficinas.
+* La tres es frecuentada hacia la tarde - noche pero no de madrugada, podría ser una cafetería o zona de ocio.
+* La cuatro tiene visitas regulares durante todo el día, con momentos puntuales de madrugada y de 5 a 6. Podría ser también zona de dormitorios.
+* La 5 parece que solo se frecuenta para dormir o para ocio de tarde-nocturno.
+* La 6 es más frecuentada temprano en el día y la madrugada. También podría ser un tipo de oficina o clase.
+* Un perfil similar tienen la 7 y la 8.
+* La 9 es frecuentada durante la tarde y la madrugada, podría ser otro área de dormitorio.
+* La 10 tiene un aumento de visitas esporádicas a ciertas horas, podría ser una zona de tránsito. 
+
+## Creación del grafo de interacciones wifi
+
+Teniendo en cuenta los datos de los que se dispone en otros datasets (actividades, bluetooth, ect) parece razonable usar una rejilla temporal ajustada a la semana. En una semana se puede ver el cambio en el ciclo de la gripe, ya que suele durar algo menos de una semana. Y ver el comportamiento de los síntomas asociados a la gripe es el objetivo de este trabajo.
+
+Primero se calcula una tabla agregada por los criterios de usuario, semana y ubicación/cluster. El valor de *intensidad de la presencia de un sujeto en una ubicación* o importancia será una simple cuenta de los eventos wifi registrados. Esto es así para tener una aproximación simple.
+
+```{r render=lemon_print}
+wlan_by_week <- time_distibution_wlan %>%
+                group_by(week, user_id, location) %>%
+                summarize(count = n(), .groups = 'drop')
+```
+
+Ahora se crean los pares de usuarios que están en la misma ubicación en la misma semana, es decir, la matriz de adyacencia a través de wifi.
+
+La matriz de adyacencia se construye como el producto de los eventos que nos ubican a cada usuario en una zona por si misma. Para que tenga sentido, este producto se hace usando la columna "location", la de zona, como columna para combinar. Como la resolución de nuestros datos es de semana, también se usa esta columna para combinar. 
+
+Al combinar por la zona y la semana, el resultado contiene los pares de sujetos que estuvieron en la misma zona en la misma semana, dando ocasión al contagio.
+
+Es importante ordenar la matriz e imputar los vacíos para que luego se pueda hacer producto de matrices con los sintomas y así generar un indicador numérico de la exposición al virus.
+
+```{r render=lemon_print}
+wlan_edges_by_week <- merge(wlan_by_week,
+  wlan_by_week,
+  by = c('week', 'location'),
+  all.x = TRUE)
+
+# eliminar el cruce de cada usuario con sigo mismo
+wlan_edges_by_week <- wlan_edges_by_week %>%
+                          filter(user_id.x != user_id.y) %>%
+                          arrange(week, user_id.x, user_id.y)
+```
+Para la cuenta de la intensidad de la relación se asume el mínimo de las intensidades de los dos extremos. La intensidad de relación se considera que es proporcional a las horas que ha estado un usuario en una ubicación.
+
+Si dos personas A y B han estado en una ubicación y B ha estado menos tiempo, lo razonable es pensar que han coincidido, como mucho, el tiempo que ha estado B en la ubicación. Por ello, agregamos las dos cuentas tomando el mínimo de ellas.
+
+```{r render=lemon_print}
+wlan_edges_by_week <- wlan_edges_by_week %>% rowwise() %>% transmute(
+                              week = week,
+                              user_id.x = user_id.x,
+                              user_id.y = user_id.y,
+                              weight = min(count.x, count.y),
+                      ) %>% 
+                      group_by(week, user_id.x, user_id.y) %>%
+                      summarise(weight = sum(weight), .groups = 'drop')
+```
+Imputamos ahora los datos faltantes para poder construir una matriz cuadrada. Hay dos tipos de datos faltantes: los de sujetos que no han tenido registros esa semana (por errores de software u otras causas), y la de semanas que no tienen datos de algún sujeto o de todos.
+
+Vamos a ver que sujetos tenemos en la matriz de datos actual y cuantos deberíamos tener.
+
+```{r render=lemon_print}
+data.frame(
+  "sujetos en el mapa de wifis" = length(unique(wlan_edges_by_week$user_id.x)),
+  "sujetos totales" = length(unique(subjects$user_id))
+)
+```
+
+Se puede ver que no están todos.
+
+Para crear una base para imputar, se genera la rejilla completa, con semanas desde la 40 hasta la 74 y todos los pares de usuarios y con pesos 0. Las semanas elegidas son aquellas en las que existen datos.
+
+La *lista de arcos del grafo* final será la combinación de los datos que tenemos ya generados y la rejilla con los pesos a cero. 
+
+Esta combinación se vuelve a agrupar para eliminar duplicados y se agrega sumando el valor de los pesos, de tal manera que si existe un registro de (semana, usuario.x, usuario.y) con peso mayor que cero y otro con cero, prevalezca el que tiene peso mayor que cero.
+
+```{r render=lemon_print}
+grid.weeks <- 40:74
+grid.users <- subjects$user_id
+wifi_full_grid <-
+  expand.grid(week = grid.weeks,
+              user_id.x = grid.users,
+              user_id.y = grid.users)
+wifi_full_grid$weight = 0
+
+wifi_full_grid <- wifi_full_grid %>%
+  full_join(wlan_edges_by_week) %>%
+  group_by(week, user_id.x, user_id.y) %>%
+  summarise(weight = max(weight), .groups = 'drop')
+```
+
+Ahora, desde la *lista de arcos de grafo completa*, construimos la matriz de adyacencia mediante un giro/pivotado de los datos. Al final, la matriz de adyacencia no es más que la lista de arcos puesta en formato ancho.
+
+```{r render=lemon_print}
+wlan_adjacency_by_week <- wifi_full_grid %>% 
+  pivot_wider(names_from = user_id.y, values_from = weight, values_fill = 0)
+```
+
+Pintamos la matriz de adyacencia como grafo para una semana. La información de las ubicaciones la hemos perdido al agregarla porque no va a ser relevante para calcular la *exposición al síntoma*:
+
+```{r warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(network))
+
+sel_week <- 66
+
+edges <- wlan_edges_by_week %>%
+  ungroup %>%
+  filter(week == sel_week) %>%
+  dplyr::select(user_id.x, user_id.y, weight) %>%
+  transmute(from = user_id.x,
+            to = user_id.y,
+            weight = weight) %>% filter(weight > mean(weight))
+
+nodes <- unique(subjects %>% dplyr::select(user_id))
+
+routes_network <-
+  network(
+    edges,
+    vertex.attr = nodes,
+    matrix.type = "edgelist",
+    ignore.eval = FALSE
+  )
+plot(
+  routes_network,
+  vertex.cex = 1,
+  mode = "circle",
+  main = paste0("Semana ", sel_week)
+)
+```
+
+Guardamos la matriz de adyacencia de Wifi para poder usar las relaciones entre personas a través de wifi en la tabla final del modelo como un indicio más de la propagación de la enfermedad.
+
+```{r eval=FALSE}
+saveRDS(wlan_adjacency_by_week, "wlan_adjacency_by_week.RData")
+
+wlan_adjacency_by_week = readRDS("wlan_adjacency_by_week.RData")
+write.csv2(wlan_adjacency_by_week,
+           "wlan_adjacency_by_week.csv",
+           row.names = FALSE)
+```
+
+
+
+

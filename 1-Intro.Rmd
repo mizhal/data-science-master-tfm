@@ -1,0 +1,232 @@
+---
+title: "Trabajo de Fin de Master"
+author: "Miguel Pérez Barrero"
+output: 
+  html_document:
+    self_contained: false
+---
+
+<style type="text/css">
+  body {
+    font-size: 11pt;
+  }
+  
+  h1 {
+    font-size: 14pt!important;
+  }
+
+  h2 {
+    font-size: 11pt!important;
+    font-weight: bold;
+  }
+  
+  h3, h4, h5 {
+    font-size: 11pt!important;
+    font-style: italic;
+  }
+</style>
+
+```{r setup-1, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Diseño técnico
+
+El objetivo del trabajo es determinar si existe una manera de modelar la gravedad de alguno de los síntomas contenidos en el dataset "flu" partiendo de los datos de relaciones entre sujetos.
+Los datos de relaciones entre sujetos necesitamos extraerlos de las tablas que representan algo común entre ellos.
+
+Algunas de ellas representan relaciones de manera directa, como por ejemplo la encuesta de amistades o la proximidad entre móviles. En otros casos se representa algo "común" entre los sujetos que implica que han tenido que estar juntos en un determinado lugar o durante un determinado tiempo, como puede ser estar conectados a las mismas wifis con intensidades similares o participar en la misma actividad del campus.
+
+En todos los casos, se generará una matriz de adyacencia de Grafo que represente las interacciones entre sujetos en cada arco. Además cada arco tendrá un peso asociado que nos indicará la importancia de dicha interacción. 
+
+Cada tabla no genera un único grafo, si no uno por cada bloque de tiempo en el que se dividirá el experimento. Al conjunto de estos bloques lo llamaremos *Rejilla de tiempo*
+
+Por otro lado tendremos una tabla de síntomas. En este caso agregaremos los datos de síntomas en un bloque de tiempo que sea coincidente con la Rejilla de tiempo por cada sujeto. La consideraremos una matriz columna.
+
+Una vez construidas las matrices de multi-grafos y la de síntomas., se aplicará una formula para calcular la *exposición* del sujeto al síntoma. Esta formula considera que la exposición de un sujeto a un síntoma es el producto escalar entre la columna de síntomas *de una semana*. y la fila de la matriz de adyacencia correspondiente al usuario y a la semana.
+
+Como tenemos varias matrices, habrá varios tipos de exposiciones: exposición por wifi, exposición por bluetooth, exposición por actividad de campus, exposición por amistad...
+
+El modelo final que se quiere ajustar partirá de una tabla en la que, para cada semana y para cada sujeto se calcularán las exposiciones de las tres semanas anteriores a través de los cuatro medios de relación mencionados (wifi, bluetooth, actividad, amistad). 
+
+La columna de "clase" o variable dependiente será el estado del síntoma para cada sujeto en la semana actual.
+
+El número de registros totales de la tabla para el modelo final depende del número de usuarios y de las semanas en las que tenemos datos de síntomas y de las matrices de adyacencia, ya que para cada usuario se generan varias filas, una por semana.
+
+El objetivo final consiste en obtener un modelo que demuestre que existe relación entre alguno de los modos de exposición y la presencia de uno de los síntomas. Eventualmente, dicho modelo se podría usar para predecir los síntomas de semana siguiente usando datos de la semana actual y las dos anteriores.
+
+Esta estrategia se planea en parte haciendo uso de lo mencionado en los artículos que acompañan al dataset, pero evitando modelos dinámicos o de agentes como se hace en los artículos.
+
+Empezaremos generando el grafo de interacción asociado a los datos de la wifi.
+
+# Procesado de los datos
+
+```{r Librerías-1, results='hide', message=FALSE, warning=FALSE, echo=FALSE}
+library(tidyr)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(visdat)
+library(data.table)
+library(graphics)
+library(reticulate)
+library(lubridate)
+library(lemon)
+knit_print.data.frame <- lemon_print
+```
+
+## Carga de datos
+
+```{r Carga de datos-1}
+base_dir <- '../../datasets/SocialEvolution/'
+
+calls <- read.csv2(paste0(base_dir, 'Calls.csv'), sep = ',')
+sms <- read.csv2(paste0(base_dir, 'SMS.csv'), sep = ',')
+proximity <- read.csv2(paste0(base_dir, 'Proximity.csv'), sep = ',')
+wlan <- read.csv2(paste0(base_dir, 'WLAN2.csv'), sep = ',')
+relationships <-
+  read.csv2(paste0(base_dir, 'RelationshipsFromSurveys.csv'), sep = ',')
+activities <-
+  read.csv2(paste0(base_dir, 'Activities.csv'), sep = ',')
+flu <- read.csv2(paste0(base_dir, 'FluSymptoms.csv'), sep = ',')
+health <- read.csv2(paste0(base_dir, 'Health.csv'), sep = ',')
+politics <- read.csv2(paste0(base_dir, 'Politics.csv'), sep = ',')
+music_aware <-
+  read.csv2(paste0(base_dir, 'MusicGenreAwareness.csv'), sep = ',')
+music_immersion <-
+  read.csv2(paste0(base_dir, 'MusicGenreImmersion.csv'), sep = ',')
+music_pref <-
+  read.csv2(paste0(base_dir, 'MusicGenrePreference.csv'), sep = ',')
+subjects <- read.csv2(paste0(base_dir, 'Subjects.csv'), sep = ',')
+```
+
+## Limpieza de los datos
+
+```{r Vista de pájaro, figures-side, fig.width=4, fig.asp=1, fig.show="hold", out.width="25%"}
+catalog <-
+  c(
+    'calls',
+    'sms',
+    'proximity',
+    'wlan',
+    'relationships',
+    'activities',
+    'flu',
+    'health',
+    'politics',
+    'music_aware',
+    'music_immersion',
+    'music_pref',
+    'subjects'
+  )
+datasets = list(
+  calls,
+  sms,
+  proximity,
+  wlan,
+  relationships,
+  activities,
+  flu,
+  health,
+  politics,
+  music_aware,
+  music_immersion,
+  music_pref,
+  subjects
+)
+
+for (index in seq_along(datasets)) {
+  print(vis_dat(datasets[[index]], warn_large_data = FALSE) + labs(title = catalog[index]))
+}
+```
+
+Todos los datasets están bastante completos excepto unos pocos que tienen falta de datos:
+
+* `health`: no tiene muchos datos de peso y alguna línea casi sin datos.
+* `calls`: faltan muchos destinatarios y algún que otro origen
+* `sms`: faltan muchos destinatarios
+  
+# Modelado de la ubicación usando la wifi.
+
+El objetivo es construir ubicaciones a partir de las MACs de las LANs. Por cuestiones de protección de datos, el dataset del experimento no contiene la ubicación física de los puntos de acceso wifi, así que no podremos obtener ubicaciones reales por triangulación.
+
+Sabemos que en un momento dado un usuario está conectado a N LANs con diferente intensidad. Si otro usuario está conectado a las mismas o similares N LANs con intensidades similares, lo razonable es pensar que está cerca.
+
+Se pueden separar las macs mas importantes por ser las que aparecen en el registro con más de un usuario en un rango de tiempo determinado.
+
+En un primer escaneo miramos cuantos usuarios hay en el mismo instante de tiempo
+```{r Cuenta usuarios simultáneos, render=lemon_print}
+hour <- 3600
+
+count_events <- wlan %>% 
+  mutate(cell = unix_time %/% (hour/6)) %>%
+  group_by(wireless_mac, user_id, cell) %>% 
+  summarise(total = n(), .groups = "drop") %>%
+  group_by(total) %>% summarise(count = n(), .groups = "drop")
+count_events
+```
+
+Miramos que wifis son más importantes, porque tienen la mayoría de los eventos de los usuarios que traceamos
+El criterio será: las wifis que son visitadas por al menos 3 de nuestros usuarios objetivo en intervalos de 10 minutos.
+
+```{r}
+relevant_wifis <- wlan %>% 
+  mutate(cell = unix_time %/% (hour/6)) %>%
+  group_by(wireless_mac, user_id, cell) %>% 
+  summarise(total = n(), .groups = "keep") %>%
+  filter(total > 3)
+macs <- unique(relevant_wifis$wireless_mac)
+```
+
+Vamos a verificar que no hemos perdido las trazas enteras de algún sujeto al reducir las WLANs.
+
+```{r}
+orig_users <- sort(unique(wlan$user_id))
+filtered_wlan_events <- wlan %>% filter(wireless_mac %in% macs)
+all_users_present <- orig_users == sort(unique(filtered_wlan_events$user_id))
+unique(all_users_present)
+```
+
+
+Una vez eliminadas las wifis poco relevantes, intentamos clusterizar el resto. Los clusters que obtengamos los consideramos zonas de incidencia.
+La idea es lograr una especie de teselación. Se puede intentar agrupar las wifis que significan una misma area o agrupar los eventos en áreas cuando tienen la misma distancia a las mismas (o similares) wifis.
+
+
+```{r}
+length(macs)
+```
+
+Ahora tenemos 37 áreas de interés. La idea es clusterizarlas para manejar un número razonable de ellas.
+
+Después obtener una "traza" del usuario tomando unos intervalos de tiempo definidos. Esta sería la traza de ubicaciones. De otras tablas podemos obtener la traza de contactos. 
+
+El propio artículo dice que no se puede obtener la ubicación precisa con los datos que están a disposición en la web. La estrategia por tanto es intentar clusterizar los datos directamente, de tal manera que se vea que los usuarios cuando están "en el mismo sitio" tienen una intensidad de conexión parecida a "las mismas wifis".
+
+Es mejor usar las 37 wifis como dimensiones, de tal modo que, en un mismo bloque de tiempo, 10 minutos por ejemplo, cada individuo se define por un vector compuesto por las intensidades a cada una de las 37 wifis. De esta forma se puede aplicar bien reducción de dimensión y clustering después para determinar las "zonas".
+
+Y parece completamente razonable decir que los puntos que están a distancias parecidas de las mismas wifis están "cerca".
+
+La forma de trabajar con el tiempo en este caso es usar cada posición / registro como una muestra más del "mapa" de wifis. Es decir, como un punto más, no como puntos que se mueven.
+Posteriormente, cada posición se asociará al usuario para saber donde estaba en ese momento.
+
+Es decir, la estrategia es:
+
+* Clusterizar el conjunto de posiciones de la tabla de intensidades de señal de cada wifi relevante.
+* Una vez clusterizado, ver a que región corresponde la posición de un usuario en un tiempo determinado.
+* Generar una tabla cruzada entre cada par de sujetos utilizando la ubicación en zona en cada bloque de diez minutos. De esta manera los usuarios que estaban en la misma zona tendrán una relación y el peso de dicha relación corresponderá al número de eventos wifi registrados en esos 10 minutos.
+
+Guardamos los datos que hemos limpiado para procesarlos en la siguiente fase.
+
+```{r}
+positions_wifi_space <- data.frame(filtered_wlan_events) %>%
+  mutate(position_id = paste0(user_id, ":", unix_time)) %>%
+  select(position_id, wireless_mac, strength, time, unix_time, user_id) %>%
+  filter(strength != 0) %>% # eliminamos las wifis que pudieran tener cero señal
+  pivot_wider(names_from = wireless_mac,
+              values_from = strength,
+              values_fill = 0)
+write.csv(positions_wifi_space, "positions_wifi_space.csv", row.names = FALSE)
+```
+
+
